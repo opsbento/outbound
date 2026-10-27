@@ -1,0 +1,107 @@
+name: Build and release Linux binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            include_dir: x86_64-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            include_dir: aarch64-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 1
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Confirm checkout is the requested tag
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install eBPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev
+      - name: Compile eBPF
+        env:
+          INCLUDE_DIR: ${{ matrix.include_dir }}
+        run: |
+          clang -O2 -g -fdebug-prefix-map="$GITHUB_WORKSPACE"=. -fdebug-compilation-dir=. -target bpf -I"/usr/include/$INCLUDE_DIR" -c bpf/connect.bpf.c -o cmd/outbound/connect.bpf.o
+      - name: Test and inspect source
+        run: |
+          go mod verify
+          go test ./...
+          go vet ./...
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Build and inspect binary
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -o "dist/outbound-${RELEASE_TAG}-linux-${ARCH}" ./cmd/outbound
+          go run golang.org/x/vuln/cmd/govulncheck@latest -mode=binary "dist/outbound-${RELEASE_TAG}-linux-${ARCH}"
+          (cd dist && sha256sum "outbound-${RELEASE_TAG}-linux-${ARCH}" > "outbound-${RELEASE_TAG}-linux-${ARCH}.sha256")
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          (cd dist && sha256sum --check *.sha256)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to replace assets" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes

@@ -1,0 +1,8 @@
+*.pem
+*.key
+.env
+ansible/*.retry
+dist/
+ansible/
+file.prd
+*.md
