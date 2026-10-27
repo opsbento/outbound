@@ -73,6 +73,7 @@ jobs:
           clang -O2 -g -fdebug-prefix-map="$GITHUB_WORKSPACE"=. -fdebug-compilation-dir=. -target bpf -I"/usr/include/$INCLUDE_DIR" -c bpf/connect.bpf.c -o cmd/outbound/connect.bpf.o
       - name: Test and inspect source
         run: |
+          go mod tidy -diff
           go mod verify
           go test ./...
           go vet ./...
