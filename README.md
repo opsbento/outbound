@@ -18,11 +18,13 @@ case "$(uname -m)" in
 esac
 ASSET="outbound-${VERSION}-linux-${ARCH}"
 BASE="https://github.com/${REPO}/releases/download/${VERSION}"
-for file in "$ASSET" "$ASSET.sha256" config.example.yaml outbound.service outbound.logrotate LICENSE SHA256SUMS; do
-  curl -fL --retry 3 -O "${BASE}/${file}" || exit 1
+curl -fL --retry 3 -O "${BASE}/${ASSET}"
+DIGEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" | python3 -c 'import json,re,sys; name=sys.argv[1]; assets=[a for a in json.load(sys.stdin)["assets"] if a["name"]==name]; assert len(assets)==1 and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", assets[0]["digest"]); print(assets[0]["digest"].split(":",1)[1])' "$ASSET") || exit 1
+printf '%s  %s\n' "$DIGEST" "$ASSET" | sha256sum --check || exit 1
+RAW="https://raw.githubusercontent.com/${REPO}/${VERSION}/packaging"
+for file in config.example.yaml outbound.service outbound.logrotate; do
+  curl -fL --retry 3 -O "${RAW}/${file}" || exit 1
 done
-sha256sum --check "$ASSET.sha256" || exit 1
-sha256sum --ignore-missing --check SHA256SUMS || exit 1
 ```
 
 Review `config.example.yaml`, then install the downloaded files:
@@ -56,7 +58,7 @@ settings:
   log_reverse_dns: true
   dns_refresh_interval: "30s"
   max_ip_entries: 1024
-  cover_all_udp: false
+  cover_all_udp: true
 allowlist:
   domains:
     - "metadata.google.internal"
@@ -64,12 +66,17 @@ allowlist:
     - "*.googleapis.com"
     - "*.amazonaws.com"
   cidrs:
-    - "203.0.113.10/32"       # example only: replace with your destination IP
+    - cidr: "127.0.0.53/32" # Ubuntu DNS stub; confirm /etc/resolv.conf
+      ports: [53]
+    - cidr: "10.10.10.10/32" # SSH allowed only to this IP
+      ports: [22, 2222]
+    - cidr: "10.10.10.20/32" # app port allowed only to this IP
+      ports: [3000]
 ```
 
 Exact domains are resolved at startup and refreshed periodically. Wildcards learn IPs from ordinary UDP DNS replies; `*.amazonaws.com` does not include `amazonaws.com` itself. Add it separately if needed. The final decision uses destination **IP**, so another service or proxy on an allowed IP can also be reached.
 
-All outbound TCP ports, including SSH port 22, follow the same allowlist. UDP port 443 is covered by default. To cover other UDP ports, set `cover_all_udp: true` and allow your DNS resolver IP in `cidrs` first. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
+Each CIDR or domain may be a string (any port) or an object with `cidr`/`domain` and `ports` (up to 16 ports). For example, `- {domain: "*.example.com", ports: [1138, 2218]}` permits those ports on learned IPs. Exact-domain and CIDR rules for the same IP combine their ports; the most specific CIDR wins when CIDRs overlap. All TCP and UDP destination ports are checked; `cover_all_udp: true` is required. Allow the DNS resolver IP on port 53 before enforcing. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
 
 After changing the config:
 
@@ -84,10 +91,19 @@ sudo systemctl restart outbound
 sudo systemctl status outbound --no-pager -l
 sudo tail -f /var/log/outbound/outbound.log
 sudo journalctl -u outbound -n 50 --no-pager
-sudo /usr/local/bin/outbound --policy-status  # enforce mode only
+sudo /usr/local/bin/outbound --policy-status
 ```
 
-In `enforce` mode, pinned eBPF links keep the last policy attached if the daemon stops or crashes. A reboot clears those links until the service starts again. To intentionally disable enforcement, use a trusted console or SSH session:
+The log file contains one JSON object per line. `destination_observed` records the decision, transport, destination IP and port, and optional reverse DNS name. `policy_sha256` identifies the loaded config; compare it with `sha256sum /etc/outbound/config.yaml`. `ip_policy_sha256` on `service_started` and `ip_policy_changed` identifies the resolved exact-domain and CIDR map; it excludes IPs learned from wildcard DNS. Logs also contain the host, boot ID, binary version, and event schema version.
+
+```sh
+sudo tail -n 20 /var/log/outbound/outbound.log | jq -c 'select(.event == "destination_observed")'
+sha256sum /etc/outbound/config.yaml
+```
+
+Destination logs are aggregated by eBPF per destination between one-second drains. At `log_level: info`, repeated ALLOW destinations are logged at most once every five minutes; BLOCK and WOULD_BLOCK decisions are never suppressed by that setting. Use `log_level: debug` for more detail. This is not a per-connection or per-process audit trail. The local logrotate file keeps seven rotated files; forward the JSONL or journal to a protected central log service for longer retention and review.
+
+Pinned eBPF links retain the selected mode if the daemon stops or crashes. Changing `mode` and restarting the service updates those links, including `enforce` to `audit`. A reboot clears the links until the service starts again. To intentionally disable enforcement, use a trusted console or SSH session:
 
 ```sh
 sudo systemctl stop outbound

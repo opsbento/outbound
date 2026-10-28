@@ -5,6 +5,17 @@
 #include <bpf/bpf_endian.h>
 
 #define OUTBOUND_SOCK_DGRAM 2
+#define MAX_RULE_PORTS 16
+
+struct port_set {
+    __u32 count; // Zero means all ports.
+    __u16 ports[MAX_RULE_PORTS];
+};
+
+struct dns_permission {
+    __u64 expiry;
+    struct port_set ports;
+};
 
 struct destination_key {
     __u8 family;
@@ -52,39 +63,41 @@ struct wildcard_scan {
     __u64 label_bits_high;
     struct dns_suffix_hash hash;
     __u8 matched;
+    struct port_set ports;
 };
 
 struct answer_scan {
     struct __sk_buff *skb;
     __u32 offset;
+    struct port_set ports;
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 64);
     __type(key, struct dns_suffix_hash);
-    __type(value, __u8);
+    __type(value, struct port_set);
 } dns_wildcards SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 64);
     __type(key, struct dns_suffix_hash);
-    __type(value, __u8);
+    __type(value, struct port_set);
 } dns_exact SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
     __type(key, __u32);
-    __type(value, __u64);
+    __type(value, struct dns_permission);
 } dns_ipv4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 4096);
     __type(key, struct dns_ipv6_key);
-    __type(value, __u64);
+    __type(value, struct dns_permission);
 } dns_ipv6 SEC(".maps");
 
 struct {
@@ -100,7 +113,7 @@ struct { \
     __uint(max_entries, 4096); \
     __uint(map_flags, BPF_F_NO_PREALLOC); \
     __type(key, key_type); \
-    __type(value, __u8); \
+    __type(value, struct port_set); \
 } name SEC(".maps")
 
 POLICY_MAP(ipv4_policy_0, struct ipv4_key);
@@ -114,6 +127,17 @@ struct {
     __type(key, __u32);
     __type(value, struct policy_control);
 } control SEC(".maps");
+
+static __always_inline int port_set_allows(const struct port_set *ports, __u16 port)
+{
+    if (!ports) return 0;
+    if (ports->count == 0) return 1;
+    for (int i = 0; i < MAX_RULE_PORTS; i++) {
+        if (i >= ports->count) break;
+        if (ports->ports[i] == port) return 1;
+    }
+    return 0;
+}
 
 static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
 {
@@ -146,24 +170,26 @@ static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
     if (family == 4) {
         struct ipv4_key lookup = {.prefixlen = 32};
         __builtin_memcpy(lookup.address, key.address, 4);
-        allowed = policy && policy->slot == 1
-            ? bpf_map_lookup_elem(&ipv4_policy_1, &lookup) != 0
-            : bpf_map_lookup_elem(&ipv4_policy_0, &lookup) != 0;
+        struct port_set *ports = policy && policy->slot == 1
+            ? bpf_map_lookup_elem(&ipv4_policy_1, &lookup)
+            : bpf_map_lookup_elem(&ipv4_policy_0, &lookup);
+        allowed = port_set_allows(ports, port);
         if (!allowed) {
             __u32 address;
             __builtin_memcpy(&address, key.address, 4);
-            __u64 *expiry = bpf_map_lookup_elem(&dns_ipv4, &address);
-            allowed = expiry && *expiry > bpf_ktime_get_ns();
+            struct dns_permission *dns = bpf_map_lookup_elem(&dns_ipv4, &address);
+            allowed = dns && dns->expiry > bpf_ktime_get_ns() && port_set_allows(&dns->ports, port);
         }
     } else {
         struct ipv6_key lookup = {.prefixlen = 128};
         __builtin_memcpy(lookup.address, key.address, 16);
-        allowed = policy && policy->slot == 1
-            ? bpf_map_lookup_elem(&ipv6_policy_1, &lookup) != 0
-            : bpf_map_lookup_elem(&ipv6_policy_0, &lookup) != 0;
+        struct port_set *ports = policy && policy->slot == 1
+            ? bpf_map_lookup_elem(&ipv6_policy_1, &lookup)
+            : bpf_map_lookup_elem(&ipv6_policy_0, &lookup);
+        allowed = port_set_allows(ports, port);
         if (!allowed) {
-            __u64 *expiry = bpf_map_lookup_elem(&dns_ipv6, key.address);
-            allowed = expiry && *expiry > bpf_ktime_get_ns();
+            struct dns_permission *dns = bpf_map_lookup_elem(&dns_ipv6, key.address);
+            allowed = dns && dns->expiry > bpf_ktime_get_ns() && port_set_allows(&dns->ports, port);
         }
     }
 
@@ -220,7 +246,9 @@ static long hash_suffix_byte(__u64 index, void *data)
     scan->hash.first = scan->hash.first * 131 + byte;
     scan->hash.second = scan->hash.second * 137 + byte;
     if (relative == 0) {
-        if (bpf_map_lookup_elem(&dns_exact, &scan->hash)) {
+        struct port_set *ports = bpf_map_lookup_elem(&dns_exact, &scan->hash);
+        if (ports) {
+            scan->ports = *ports;
             scan->matched = 1;
             return 1;
         }
@@ -228,15 +256,19 @@ static long hash_suffix_byte(__u64 index, void *data)
         __u64 label_bit = relative < 64
             ? (scan->label_bits_low >> relative) & 1
             : (scan->label_bits_high >> (relative - 64)) & 1;
-        if (label_bit && bpf_map_lookup_elem(&dns_wildcards, &scan->hash)) {
-            scan->matched = 1;
-            return 1;
+        if (label_bit) {
+            struct port_set *ports = bpf_map_lookup_elem(&dns_wildcards, &scan->hash);
+            if (ports) {
+                scan->ports = *ports;
+                scan->matched = 1;
+                return 1;
+            }
         }
     }
     return 0;
 }
 
-static __always_inline int allowed_question(struct __sk_buff *skb, __u32 start, __u32 *end)
+static __always_inline int allowed_question(struct __sk_buff *skb, __u32 start, __u32 *end, struct port_set *ports)
 {
     __u32 pos = start;
     struct wildcard_scan scan = {.skb = skb, .start = start};
@@ -267,6 +299,7 @@ static __always_inline int allowed_question(struct __sk_buff *skb, __u32 start, 
     scan.length = *end - start;
     if (bpf_loop(scan.length, hash_suffix_byte, &scan, 0) < 0)
         return 0;
+    if (scan.matched) *ports = scan.ports;
     return scan.matched;
 }
 
@@ -303,17 +336,20 @@ static long learn_answer(__u64 index, void *data)
     if (ttl > 3600)
         ttl = 3600;
     if (ttl && record[2] == 0 && record[3] == 1) {
-        __u64 expiry = bpf_ktime_get_ns() + (__u64)ttl * 1000000000ULL;
+        struct dns_permission permission = {
+            .expiry = bpf_ktime_get_ns() + (__u64)ttl * 1000000000ULL,
+            .ports = scan->ports,
+        };
         if (record[0] == 0 && record[1] == 1 && length == 4) {
             __u32 address;
             if (bpf_skb_load_bytes(skb, payload, &address, 4) == 0 &&
                 public_ipv4((const __u8 *)&address))
-                bpf_map_update_elem(&dns_ipv4, &address, &expiry, BPF_ANY);
+                bpf_map_update_elem(&dns_ipv4, &address, &permission, BPF_ANY);
         } else if (record[0] == 0 && record[1] == 28 && length == 16) {
             __u8 address[16];
             if (bpf_skb_load_bytes(skb, payload, address, 16) == 0 &&
                 public_ipv6(address))
-                bpf_map_update_elem(&dns_ipv6, address, &expiry, BPF_ANY);
+                bpf_map_update_elem(&dns_ipv6, address, &permission, BPF_ANY);
         }
     }
     scan->offset = payload + length;
@@ -370,12 +406,13 @@ int observe_dns_reply(struct __sk_buff *skb)
         return 1;
     __u32 question = dns + 12;
     __u32 offset = 0;
-    if (!allowed_question(skb, question, &offset))
+    struct port_set ports = {};
+    if (!allowed_question(skb, question, &offset, &ports))
         return 1;
     __u8 query[4];
     if (bpf_skb_load_bytes(skb, offset, query, 4) != 0 || query[2] != 0 || query[3] != 1)
         return 1;
-    struct answer_scan scan = {.skb = skb, .offset = offset + 4};
+    struct answer_scan scan = {.skb = skb, .offset = offset + 4, .ports = ports};
     bpf_loop(answers, learn_answer, &scan, 0);
     return 1;
 }

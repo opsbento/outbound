@@ -3,12 +3,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -24,8 +25,9 @@ import (
 )
 
 type config struct {
-	Version  string `yaml:"version"`
-	Settings struct {
+	PolicySHA256 string `yaml:"-"`
+	Version      string `yaml:"version"`
+	Settings     struct {
 		Mode               string `yaml:"mode"`
 		LogLevel           string `yaml:"log_level"`
 		LogFile            string `yaml:"log_file"`
@@ -35,8 +37,8 @@ type config struct {
 		CoverAllUDP        bool   `yaml:"cover_all_udp"`
 	} `yaml:"settings"`
 	Allowlist struct {
-		Domains []string `yaml:"domains"`
-		CIDRs   []string `yaml:"cidrs"`
+		Domains []policyRule `yaml:"domains"`
+		CIDRs   []policyRule `yaml:"cidrs"`
 	} `yaml:"allowlist"`
 }
 
@@ -50,7 +52,14 @@ func loadConfig(path string) (config, error) {
 	}
 	defer f.Close()
 
-	dec := yaml.NewDecoder(f)
+	data, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
+	if err != nil {
+		return cfg, fmt.Errorf("read configuration: %w", err)
+	}
+	if len(data) > 1<<20 {
+		return cfg, errors.New("configuration exceeds 1 MiB")
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return cfg, err
@@ -62,6 +71,7 @@ func loadConfig(path string) (config, error) {
 		}
 		return cfg, errors.New("configuration must contain exactly one YAML document")
 	}
+	cfg.PolicySHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
 
 	if cfg.Version != "v1" {
 		return cfg, fmt.Errorf("unsupported config version %q", cfg.Version)
@@ -83,6 +93,9 @@ func loadConfig(path string) (config, error) {
 	if cfg.Settings.MaxIPEntries < 1 {
 		return cfg, errors.New("max_ip_entries must be positive")
 	}
+	if !cfg.Settings.CoverAllUDP {
+		return cfg, errors.New("cover_all_udp must be true to monitor all UDP destination ports")
+	}
 
 	if cfg.Settings.LogFile != "" && !filepath.IsAbs(cfg.Settings.LogFile) {
 		return cfg, errors.New("log_file must be an absolute path")
@@ -96,7 +109,11 @@ func loadConfig(path string) (config, error) {
 	}
 
 	seenCIDRs := make(map[netip.Prefix]bool)
-	for _, cidr := range cfg.Allowlist.CIDRs {
+	for _, rule := range cfg.Allowlist.CIDRs {
+		if rule.kind == "domain" {
+			return cfg, fmt.Errorf("CIDR entry %q uses domain key", rule.Name)
+		}
+		cidr := rule.Name
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
@@ -113,7 +130,11 @@ func loadConfig(path string) (config, error) {
 	seenDomains := make(map[string]bool)
 	wildcardCount := 0
 	exactCount := 0
-	for _, domain := range cfg.Allowlist.Domains {
+	for _, rule := range cfg.Allowlist.Domains {
+		if rule.kind == "cidr" {
+			return cfg, fmt.Errorf("domain entry %q uses cidr key", rule.Name)
+		}
+		domain := rule.Name
 		if strings.HasPrefix(domain, "*.") {
 			if _, err := wildcardDNSName(domain); err != nil {
 				return cfg, err
@@ -143,15 +164,6 @@ type endpoint struct {
 	Port uint16
 }
 
-type timestampWriter struct{ file *os.File }
-
-func (writer timestampWriter) Write(line []byte) (int, error) {
-	if _, err := fmt.Fprintf(writer.file, "%s %s", time.Now().UTC().Format(time.RFC3339), line); err != nil {
-		return 0, err
-	}
-	return len(line), nil
-}
-
 func run(configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -164,11 +176,21 @@ func run(configPath string) error {
 			return fmt.Errorf("open log file: %w", err)
 		}
 		defer file.Close()
-		output = io.MultiWriter(os.Stdout, timestampWriter{file})
+		output = io.MultiWriter(os.Stdout, file)
 	}
-	logger := log.New(output, "", 0)
-	logEvents := cfg.Settings.LogLevel == "debug" || cfg.Settings.LogLevel == "info"
-	logWarnings := cfg.Settings.LogLevel != "error"
+	host, _ := os.Hostname()
+	bootID, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	logger := &auditLogger{output: output, mode: cfg.Settings.Mode, hash: cfg.PolicySHA256, host: host, bootID: strings.TrimSpace(string(bootID))}
+	logAllow := cfg.Settings.LogLevel == "debug" || cfg.Settings.LogLevel == "info"
+	logFailures := make(chan error, 1)
+	reportLogFailure := func(err error) {
+		if err != nil {
+			select {
+			case logFailures <- err:
+			default:
+			}
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -176,13 +198,18 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
+	ipPolicyHash := ipPolicyDigest(policy)
 	monitor, err := openConnectMonitor(policy, cfg.Settings.Mode == "enforce", cfg.Settings.CoverAllUDP, cfg.Allowlist.Domains)
 	if err != nil {
 		return err
 	}
 	defer monitor.Close()
-	if logEvents {
-		logger.Printf("%s monitoring started (TCP and %s; policy entries: %d, reverse DNS: %t)", strings.ToUpper(cfg.Settings.Mode), map[bool]string{true: "all UDP", false: "UDP 443"}[cfg.Settings.CoverAllUDP], len(policy), cfg.Settings.LogReverseDNS)
+	udpCoverage := "443"
+	if cfg.Settings.CoverAllUDP {
+		udpCoverage = "all"
+	}
+	if err := logger.write(auditRecord{Level: "INFO", Event: "service_started", PolicyEntries: len(policy), UDPCoverage: udpCoverage, IPPolicySHA256: ipPolicyHash}); err != nil {
+		return err
 	}
 	if err := notifySystemdReady(); err != nil {
 		return fmt.Errorf("notify systemd readiness: %w", err)
@@ -195,14 +222,15 @@ func run(configPath string) error {
 	}
 	var lookups chan observedDestination
 	var workers sync.WaitGroup
-	if logEvents && cfg.Settings.LogReverseDNS {
+	if cfg.Settings.LogReverseDNS {
 		lookups = make(chan observedDestination, 64)
 		for range 4 {
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
 				for observed := range lookups {
-					logger.Print(formatDestination(cfg.Settings.Mode, observed.transport, observed.remote, reverseDNS(ctx, observed.remote.IP), observed.allowed))
+					record := destinationRecord(cfg.Settings.Mode, observed.transport, observed.remote, reverseDNS(ctx, observed.remote.IP), observed.allowed)
+					reportLogFailure(logger.write(record))
 				}
 			}()
 		}
@@ -226,8 +254,15 @@ func run(configPath string) error {
 			if err == nil {
 				err = monitor.RefreshPolicy(updated, cfg.Settings.Mode == "enforce", cfg.Settings.CoverAllUDP)
 			}
-			if err != nil && logWarnings {
-				logger.Printf("WARN policy refresh failed; previous policy retained: %v", err)
+			if err != nil {
+				if logErr := logger.write(auditRecord{Level: "WARN", Event: "policy_refresh_failed", Error: err.Error()}); logErr != nil {
+					return logErr
+				}
+			} else if updatedHash := ipPolicyDigest(updated); updatedHash != ipPolicyHash {
+				ipPolicyHash = updatedHash
+				if logErr := logger.write(auditRecord{Level: "INFO", Event: "ip_policy_changed", PolicyEntries: len(updated), IPPolicySHA256: updatedHash}); logErr != nil {
+					return logErr
+				}
 			}
 			nextRefresh = time.Now().Add(refreshInterval)
 		}
@@ -238,40 +273,58 @@ func run(configPath string) error {
 		}
 		emit := func(remote endpoint, transport string, allowed bool) {
 			key := transport + ":" + remote.IP.String() + ":" + strconv.Itoa(int(remote.Port)) + ":" + strconv.FormatBool(allowed)
-			if !shouldLogObservation(seen, key, now, cfg.Settings.MaxIPEntries) {
+			if allowed && !logAllow {
 				return
 			}
-			if !logEvents {
+			if allowed && cfg.Settings.LogLevel != "debug" && !shouldLogObservation(seen, key, now, cfg.Settings.MaxIPEntries) {
 				return
 			}
 			if lookups == nil {
-				logger.Print(formatDestination(cfg.Settings.Mode, transport, remote, "", allowed))
+				reportLogFailure(logger.write(destinationRecord(cfg.Settings.Mode, transport, remote, "", allowed)))
 				return
 			}
 			select {
 			case lookups <- observedDestination{remote, transport, allowed}:
 			default:
-				logger.Print(formatDestination(cfg.Settings.Mode, transport, remote, "", allowed))
+				reportLogFailure(logger.write(destinationRecord(cfg.Settings.Mode, transport, remote, "", allowed)))
 			}
 		}
-		if err := monitor.Drain(emit); err != nil && logWarnings {
-			logger.Printf("WARN eBPF drain failed: %v", err)
+		if err := monitor.Drain(emit); err != nil {
+			if logErr := logger.write(auditRecord{Level: "ERROR", Event: "observation_drain_failed", Error: err.Error()}); logErr != nil {
+				return logErr
+			}
+			return err
+		}
+		select {
+		case err := <-logFailures:
+			return err
+		default:
 		}
 		select {
 		case <-ctx.Done():
-			if logEvents {
-				logger.Printf("%s HTTP(S) monitoring stopped", strings.ToUpper(cfg.Settings.Mode))
+			if lookups != nil {
+				close(lookups)
+				workers.Wait()
+				lookups = nil
 			}
-			return nil
+			select {
+			case err := <-logFailures:
+				return err
+			default:
+			}
+			return logger.write(auditRecord{Level: "INFO", Event: "service_stopped"})
 		case <-ticker.C:
 		}
 	}
 }
 
 func shouldLogObservation(seen map[string]time.Time, key string, now time.Time, maxEntries int) bool {
-	if _, exists := seen[key]; exists {
+	if last, exists := seen[key]; exists {
+		if now.Sub(last) < 5*time.Minute {
+			return false
+		}
 		seen[key] = now
-		return false
+		return true
 	}
 	if len(seen) < maxEntries {
 		seen[key] = now
@@ -301,21 +354,6 @@ func reverseDNS(ctx context.Context, ip netip.Addr) string {
 		return ""
 	}
 	return strings.TrimSuffix(names[0], ".")
-}
-
-func formatDestination(mode, transport string, remote endpoint, ptr string, allowed bool) string {
-	decision := "ALLOW"
-	if !allowed {
-		decision = "WOULD_BLOCK"
-		if mode == "enforce" {
-			decision = "BLOCK"
-		}
-	}
-	line := strings.ToUpper(mode) + " " + decision + " " + transport + " dst=" + net.JoinHostPort(remote.IP.String(), strconv.Itoa(int(remote.Port)))
-	if ptr != "" {
-		line += " ptr=" + ptr
-	}
-	return line
 }
 
 func main() {
@@ -366,7 +404,9 @@ func main() {
 		return
 	}
 	if err := run(*configPath); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		if logErr := (&auditLogger{output: os.Stderr}).write(auditRecord{Level: "ERROR", Event: "service_failed", Error: err.Error()}); logErr != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		os.Exit(1)
 	}
 }

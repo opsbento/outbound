@@ -3,8 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -43,18 +47,23 @@ func TestPolicyControlMatchesEBPFLayout(t *testing.T) {
 	if size := unsafe.Sizeof(policyControl{}); size != 12 {
 		t.Fatalf("policy control map value is %d bytes, want 12", size)
 	}
+	if size := unsafe.Sizeof(portSet{}); size != 36 {
+		t.Fatalf("port set map value is %d bytes, want 36", size)
+	}
 }
 
-func TestFormatDestination(t *testing.T) {
+func TestDestinationRecord(t *testing.T) {
 	remote := endpoint{IP: netip.MustParseAddr("8.8.8.8"), Port: 443}
-	if got := formatDestination("audit", "TCP", remote, "dns.google", true); got != "AUDIT ALLOW TCP dst=8.8.8.8:443 ptr=dns.google" {
-		t.Fatalf("formatted line = %q", got)
+	allowed := destinationRecord("audit", "TCP", remote, "dns.google", true)
+	if allowed.Decision != "ALLOW" || allowed.DestinationIP != "8.8.8.8" || allowed.DestinationPort != 443 || allowed.PTR != "dns.google" {
+		t.Fatalf("allowed record = %+v", allowed)
 	}
-	if got := formatDestination("enforce", "TCP", remote, "", false); got != "ENFORCE BLOCK TCP dst=8.8.8.8:443" {
-		t.Fatalf("blocked line = %q", got)
+	blocked := destinationRecord("enforce", "UDP", remote, "", false)
+	if blocked.Decision != "BLOCK" || blocked.Level != "WARN" || blocked.Transport != "UDP" {
+		t.Fatalf("blocked record = %+v", blocked)
 	}
-	if got := formatDestination("enforce", "UDP", remote, "", false); got != "ENFORCE BLOCK UDP dst=8.8.8.8:443" {
-		t.Fatalf("blocked QUIC line = %q", got)
+	if got := destinationRecord("audit", "TCP", remote, "", false).Decision; got != "WOULD_BLOCK" {
+		t.Fatalf("audit decision = %q", got)
 	}
 }
 
@@ -62,8 +71,8 @@ func TestBuildPolicyResolvesExactDomainAndKeepsCIDR(t *testing.T) {
 	var cfg config
 	cfg.Settings.Mode = "enforce"
 	cfg.Settings.MaxIPEntries = 10
-	cfg.Allowlist.Domains = []string{"example.com"}
-	cfg.Allowlist.CIDRs = []string{"169.254.169.254/32"}
+	cfg.Allowlist.Domains = []policyRule{{Name: "example.com"}}
+	cfg.Allowlist.CIDRs = []policyRule{{Name: "169.254.169.254/32"}}
 	lookup := func(_ context.Context, _, host string) ([]netip.Addr, error) {
 		if host != "example.com" {
 			t.Fatalf("unexpected host %q", host)
@@ -75,8 +84,8 @@ func TestBuildPolicyResolvesExactDomainAndKeepsCIDR(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := make(map[netip.Prefix]bool)
-	for _, prefix := range prefixes {
-		got[prefix] = true
+	for _, rule := range prefixes {
+		got[rule.Prefix] = true
 	}
 	for _, want := range []netip.Prefix{netip.MustParsePrefix("169.254.169.254/32"), netip.MustParsePrefix("93.184.215.14/32")} {
 		if !got[want] {
@@ -85,12 +94,95 @@ func TestBuildPolicyResolvesExactDomainAndKeepsCIDR(t *testing.T) {
 	}
 }
 
+func TestCIDRPortRules(t *testing.T) {
+	var cfg config
+	cfg.Settings.Mode = "enforce"
+	cfg.Settings.MaxIPEntries = 10
+	cfg.Allowlist.CIDRs = []policyRule{
+		{Name: "10.10.10.10/32", Ports: []uint16{22, 2222}},
+		{Name: "10.10.10.20/32", Ports: []uint16{3000}},
+	}
+	rules, err := buildPolicy(context.Background(), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range rules {
+		switch rule.Prefix.Addr().String() {
+		case "10.10.10.10":
+			if !rule.Ports.allows(22) || !rule.Ports.allows(2222) || rule.Ports.allows(3000) {
+				t.Fatalf("SSH rule permits wrong ports: %+v", rule)
+			}
+		case "10.10.10.20":
+			if !rule.Ports.allows(3000) || rule.Ports.allows(22) {
+				t.Fatalf("application rule permits wrong ports: %+v", rule)
+			}
+		default:
+			t.Fatalf("unexpected rule: %+v", rule)
+		}
+	}
+}
+
+func TestExactDomainAndCIDRPortsMergeOnSameIP(t *testing.T) {
+	var cfg config
+	cfg.Settings.Mode = "enforce"
+	cfg.Settings.MaxIPEntries = 10
+	cfg.Allowlist.CIDRs = []policyRule{{Name: "10.10.10.10/32", Ports: []uint16{22}}}
+	cfg.Allowlist.Domains = []policyRule{{Name: "example.com", Ports: []uint16{3000}}}
+	rules, err := buildPolicy(context.Background(), cfg, func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("10.10.10.10")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || !rules[0].Ports.allows(22) || !rules[0].Ports.allows(3000) || rules[0].Ports.allows(443) {
+		t.Fatalf("merged ports = %+v", rules)
+	}
+}
+
+func TestConfigParsesPortRulesAndRejectsInvalidPorts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	base := "version: v1\nsettings:\n  mode: enforce\n  max_ip_entries: 1024\n  cover_all_udp: true\nallowlist:\n  domains:\n    - domain: '*.example.com'\n      ports: [1138, 2218]\n  cidrs:\n    - cidr: 10.10.10.10/32\n      ports: [22]\n    - cidr: 10.10.10.20/32\n      ports: [3000]\n"
+	if err := os.WriteFile(path, []byte(base), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Allowlist.Domains) != 1 || cfg.Allowlist.Domains[0].Ports[1] != 2218 || cfg.Allowlist.CIDRs[1].Ports[0] != 3000 {
+		t.Fatalf("port rules were not parsed: %+v", cfg.Allowlist)
+	}
+	for _, ports := range []string{"[0]", "[22, 22]", "[65536]"} {
+		data := strings.Replace(base, "ports: [22]", "ports: "+ports, 1)
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(path); err == nil {
+			t.Fatalf("invalid ports %s accepted", ports)
+		}
+	}
+}
+
+func TestIPPolicyDigestIgnoresMapIterationOrder(t *testing.T) {
+	a := netip.MustParsePrefix("203.0.113.0/24")
+	b := netip.MustParsePrefix("2001:db8::/32")
+	if ipPolicyDigest([]ipRule{{Prefix: a}, {Prefix: b}}) != ipPolicyDigest([]ipRule{{Prefix: b}, {Prefix: a}}) {
+		t.Fatal("IP policy digest must not depend on map iteration order")
+	}
+	if ipPolicyDigest([]ipRule{{Prefix: a}}) == ipPolicyDigest([]ipRule{{Prefix: a}, {Prefix: b}}) {
+		t.Fatal("different IP policies must have different digests")
+	}
+	if ipPolicyDigest([]ipRule{{Prefix: a, Ports: newPortSet([]uint16{22})}}) == ipPolicyDigest([]ipRule{{Prefix: a, Ports: newPortSet([]uint16{3000})}}) {
+		t.Fatal("port changes must change policy digest")
+	}
+}
+
 func TestBuildPolicyRejectsPartialDNSFailure(t *testing.T) {
 	var cfg config
 	cfg.Settings.Mode = "enforce"
 	cfg.Settings.MaxIPEntries = 10
-	cfg.Allowlist.CIDRs = []string{"169.254.169.254/32"}
-	cfg.Allowlist.Domains = []string{"missing.example"}
+	cfg.Allowlist.CIDRs = []policyRule{{Name: "169.254.169.254/32"}}
+	cfg.Allowlist.Domains = []policyRule{{Name: "missing.example"}}
 	_, err := buildPolicy(context.Background(), cfg, func(context.Context, string, string) ([]netip.Addr, error) {
 		return nil, errors.New("DNS unavailable")
 	})
@@ -139,7 +231,7 @@ func TestWildcardPolicyWaitsForObservedDNS(t *testing.T) {
 	var cfg config
 	cfg.Settings.Mode = "enforce"
 	cfg.Settings.MaxIPEntries = 10
-	cfg.Allowlist.Domains = []string{"*.amazonaws.com"}
+	cfg.Allowlist.Domains = []policyRule{{Name: "*.amazonaws.com"}}
 	prefixes, err := buildPolicy(context.Background(), cfg, func(context.Context, string, string) ([]netip.Addr, error) {
 		t.Fatal("wildcard must not be sent to DNS as a literal hostname")
 		return nil, nil
@@ -152,35 +244,47 @@ func TestWildcardPolicyWaitsForObservedDNS(t *testing.T) {
 	}
 }
 
-func TestTimestampWriterAddsTimestampToFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "outbound.log")
-	file, err := os.Create(path)
-	if err != nil {
+func TestAuditLoggerWritesJSONLine(t *testing.T) {
+	var output bytes.Buffer
+	logger := &auditLogger{output: &output, mode: "enforce", hash: "policy-hash"}
+	if err := logger.write(auditRecord{Level: "INFO", Event: "service_started", PolicyEntries: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (timestampWriter{file}).Write([]byte("AUDIT ALLOW TCP dst=8.8.8.8:443\n")); err != nil {
-		t.Fatal(err)
+	var record auditRecord
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &record); err != nil {
+		t.Fatalf("invalid JSON line: %v", err)
 	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
+	if record.SchemaVersion != 1 || record.Event != "service_started" || record.Mode != "enforce" || record.PolicySHA256 != "policy-hash" || record.PolicyEntries != 2 {
+		t.Fatalf("audit record = %+v", record)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := time.Parse(time.RFC3339Nano, record.Time); err != nil {
+		t.Fatalf("invalid UTC timestamp %q: %v", record.Time, err)
 	}
-	if !strings.Contains(string(data), "Z AUDIT ALLOW TCP dst=8.8.8.8:443\n") {
-		t.Fatalf("file log line = %q", data)
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestAuditLoggerReportsWriteFailure(t *testing.T) {
+	logger := &auditLogger{output: failingWriter{}}
+	if err := logger.write(auditRecord{Event: "service_started"}); err == nil {
+		t.Fatal("log write failure must be reported")
 	}
 }
 
 func TestAuditConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := "version: v1\nsettings:\n  mode: audit\n  dns_refresh_interval: 30s\n  max_ip_entries: 1024\nallowlist:\n  domains: []\n  cidrs: []\n"
+	data := "version: v1\nsettings:\n  mode: audit\n  dns_refresh_interval: 30s\n  max_ip_entries: 1024\n  cover_all_udp: true\nallowlist:\n  domains: []\n  cidrs: []\n"
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadConfig(path); err != nil {
+	cfg, err := loadConfig(path)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("%x", sha256.Sum256([]byte(data))); cfg.PolicySHA256 != want {
+		t.Fatalf("policy SHA-256 = %q, want %q", cfg.PolicySHA256, want)
 	}
 	if err := os.WriteFile(path, []byte(strings.Replace(data, "mode: audit", "mode: audit\n  log_level: invalid", 1)), 0600); err != nil {
 		t.Fatal(err)
@@ -211,7 +315,7 @@ func TestAuditConfig(t *testing.T) {
 
 func TestConfigRejectsTrailingDocument(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := "version: v1\nsettings:\n  mode: audit\n  max_ip_entries: 1024\nallowlist:\n  domains: []\n  cidrs: []\n---\nsettings:\n  mode: enforce\n"
+	data := "version: v1\nsettings:\n  mode: audit\n  max_ip_entries: 1024\n  cover_all_udp: true\nallowlist:\n  domains: []\n  cidrs: []\n---\nsettings:\n  mode: enforce\n"
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +337,12 @@ func TestCoverAllUDPConfig(t *testing.T) {
 	if !cfg.Settings.CoverAllUDP {
 		t.Fatal("cover_all_udp was not loaded")
 	}
+	if err := os.WriteFile(path, []byte(strings.Replace(data, "cover_all_udp: true", "cover_all_udp: false", 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("partial UDP coverage must be rejected")
+	}
 }
 
 func TestNewDestinationRemainsVisibleWhenDeduplicationIsFull(t *testing.T) {
@@ -243,5 +353,8 @@ func TestNewDestinationRemainsVisibleWhenDeduplicationIsFull(t *testing.T) {
 	}
 	if shouldLogObservation(seen, "existing", now, 1) {
 		t.Fatal("existing destination should still be deduplicated")
+	}
+	if !shouldLogObservation(seen, "existing", now.Add(5*time.Minute), 1) {
+		t.Fatal("an allowed destination must be logged again after five minutes")
 	}
 }

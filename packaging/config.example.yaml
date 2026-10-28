@@ -7,7 +7,7 @@ settings:
   log_reverse_dns: true
   dns_refresh_interval: "30s"
   max_ip_entries: 1024
-  cover_all_udp: false       # Set true only after allowing DNS resolver IPs.
+  cover_all_udp: true        # Allow your DNS resolver at UDP 53 before enforcing.
 allowlist:
   domains:
     - "metadata.google.internal" # Exact: GCE may resolve this from /etc/hosts.
@@ -18,6 +18,11 @@ allowlist:
     - "*.google.com"          # Google package and download hosts.
     - "*.googleapis.com"      # Google Cloud APIs.
     - "*.amazonaws.com"       # AWS STS, S3, and regional/bucket hosts.
+    - domain: "*.example.com"  # Documentation-only custom service.
+      ports: [1138, 2218]
   cidrs:
-    - "192.0.2.0/24"        # Documentation-only IPv4 range.
-    - "2001:db8::/32"       # Documentation-only IPv6 range.
+    - cidr: "192.0.2.10/32" # Documentation-only SSH destination.
+      ports: [443, 8080, 22]
+    - cidr: "192.0.2.20/32" # Documentation-only application destination.
+      ports: [3000]
+    - "2001:db8::/32"       # Documentation-only IPv6 range; any port.

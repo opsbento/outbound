@@ -120,19 +120,6 @@ var policyPrograms = []struct {
 	{"observe_dns_reply", ebpf.AttachCGroupInetIngress},
 }
 
-func pinnedPolicyExists() (bool, error) {
-	for _, program := range policyPrograms {
-		_, err := os.Stat(filepath.Join(policyPinDir, program.name))
-		if err == nil {
-			return true, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return false, err
-		}
-	}
-	return false, nil
-}
-
 func detachPolicy() error {
 	for _, program := range policyPrograms {
 		err := os.Remove(filepath.Join(policyPinDir, program.name))
@@ -214,19 +201,9 @@ func checkEBPF() error {
 	return nil
 }
 
-func openConnectMonitor(policy []netip.Prefix, enforce, coverAllUDP bool, domains []string) (_ *connectMonitor, err error) {
-	if enforce {
-		if err := os.MkdirAll(policyPinDir, 0700); err != nil {
-			return nil, fmt.Errorf("create policy pin directory: %w", err)
-		}
-	} else {
-		pinned, err := pinnedPolicyExists()
-		if err != nil {
-			return nil, fmt.Errorf("inspect pinned policy: %w", err)
-		}
-		if pinned {
-			return nil, errors.New("pinned enforce policy remains active; stop outbound and run --detach-policy before switching to audit")
-		}
+func openConnectMonitor(policy []ipRule, enforce, coverAllUDP bool, domains []policyRule) (_ *connectMonitor, err error) {
+	if err := os.MkdirAll(policyPinDir, 0700); err != nil {
+		return nil, fmt.Errorf("create policy pin directory: %w", err)
 	}
 	collection, err := loadConnectCollection()
 	if err != nil {
@@ -246,7 +223,8 @@ func openConnectMonitor(policy []netip.Prefix, enforce, coverAllUDP bool, domain
 	if wildcardMap == nil || exactMap == nil {
 		return nil, errors.New("eBPF DNS domain maps are missing")
 	}
-	for _, domain := range domains {
+	for _, rule := range domains {
+		domain := rule.Name
 		wildcard := strings.HasPrefix(domain, "*.")
 		var key dnsSuffixHash
 		var keyErr error
@@ -258,7 +236,7 @@ func openConnectMonitor(policy []netip.Prefix, enforce, coverAllUDP bool, domain
 		if keyErr != nil {
 			return nil, keyErr
 		}
-		value := uint8(1)
+		value := newPortSet(rule.Ports)
 		target := exactMap
 		if wildcard {
 			target = wildcardMap
@@ -268,14 +246,11 @@ func openConnectMonitor(policy []netip.Prefix, enforce, coverAllUDP bool, domain
 		}
 	}
 	for _, program := range policyPrograms {
-		if program.name == "observe_dns_reply" && len(domains) == 0 && !enforce {
-			continue
-		}
 		p := collection.Programs[program.name]
 		if p == nil {
 			return nil, fmt.Errorf("missing eBPF program %s", program.name)
 		}
-		attached, attachErr := attachPolicyProgram(p, program.name, program.attach, enforce)
+		attached, attachErr := attachPolicyProgram(p, program.name, program.attach, true)
 		if attachErr != nil {
 			return nil, attachErr
 		}
@@ -284,7 +259,7 @@ func openConnectMonitor(policy []netip.Prefix, enforce, coverAllUDP bool, domain
 	return monitor, nil
 }
 
-func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce, coverAllUDP bool, slot uint32) error {
+func (monitor *connectMonitor) applyPolicy(prefixes []ipRule, enforce, coverAllUDP bool, slot uint32) error {
 	v4 := monitor.collection.Maps[fmt.Sprintf("ipv4_policy_%d", slot)]
 	v6 := monitor.collection.Maps[fmt.Sprintf("ipv6_policy_%d", slot)]
 	control := monitor.collection.Maps["control"]
@@ -297,8 +272,9 @@ func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce, cov
 	if err := clearPolicyMap(v6, ipv6Key{}); err != nil {
 		return err
 	}
-	for _, prefix := range prefixes {
-		value := uint8(1)
+	for _, rule := range prefixes {
+		prefix := rule.Prefix
+		value := rule.Ports
 		if prefix.Addr().Is4() {
 			key := ipv4Key{Prefixlen: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
 			if err := v4.Update(&key, &value, ebpf.UpdateAny); err != nil {
@@ -328,14 +304,14 @@ func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce, cov
 	return nil
 }
 
-func (monitor *connectMonitor) RefreshPolicy(prefixes []netip.Prefix, enforce, coverAllUDP bool) error {
+func (monitor *connectMonitor) RefreshPolicy(prefixes []ipRule, enforce, coverAllUDP bool) error {
 	return monitor.applyPolicy(prefixes, enforce, coverAllUDP, 1-monitor.slot)
 }
 
 func clearPolicyMap(m *ebpf.Map, keyType any) error {
 	var keys []any
 	iter := m.Iterate()
-	var value uint8
+	var value portSet
 	switch keyType.(type) {
 	case ipv4Key:
 		var key ipv4Key
