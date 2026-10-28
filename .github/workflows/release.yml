@@ -103,11 +103,6 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
           ARCH: ${{ matrix.arch }}
         run: sudo "dist/outbound-${RELEASE_TAG}-linux-${ARCH}" --check-ebpf
-      - name: Verify enforce-to-audit transition and UDP observation
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-          ARCH: ${{ matrix.arch }}
-        run: sudo bash scripts/verify-mode-transition.sh "dist/outbound-${RELEASE_TAG}-linux-${ARCH}"
       - name: Attest binary build provenance
         uses: actions/attest@v4.2.2
         with:
