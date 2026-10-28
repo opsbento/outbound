@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -31,7 +30,7 @@ type config struct {
 		Mode               string `yaml:"mode"`
 		LogLevel           string `yaml:"log_level"`
 		LogFile            string `yaml:"log_file"`
-		LogReverseDNS      bool   `yaml:"log_reverse_dns"`
+		LogReverseDNS      bool   `yaml:"log_reverse_dns"` // Deprecated: accepted for existing configs.
 		DNSRefreshInterval string `yaml:"dns_refresh_interval"`
 		MaxIPEntries       int    `yaml:"max_ip_entries"`
 		CoverAllUDP        bool   `yaml:"cover_all_udp"`
@@ -182,15 +181,6 @@ func run(configPath string) error {
 	bootID, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	logger := &auditLogger{output: output, mode: cfg.Settings.Mode, hash: cfg.PolicySHA256, host: host, bootID: strings.TrimSpace(string(bootID))}
 	logAllow := cfg.Settings.LogLevel == "debug" || cfg.Settings.LogLevel == "info"
-	logFailures := make(chan error, 1)
-	reportLogFailure := func(err error) {
-		if err != nil {
-			select {
-			case logFailures <- err:
-			default:
-			}
-		}
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -214,33 +204,6 @@ func run(configPath string) error {
 	if err := notifySystemdReady(); err != nil {
 		return fmt.Errorf("notify systemd readiness: %w", err)
 	}
-
-	type observedDestination struct {
-		remote    endpoint
-		transport string
-		allowed   bool
-	}
-	var lookups chan observedDestination
-	var workers sync.WaitGroup
-	if cfg.Settings.LogReverseDNS {
-		lookups = make(chan observedDestination, 64)
-		for range 4 {
-			workers.Add(1)
-			go func() {
-				defer workers.Done()
-				for observed := range lookups {
-					record := destinationRecord(cfg.Settings.Mode, observed.transport, observed.remote, reverseDNS(ctx, observed.remote.IP), observed.allowed)
-					reportLogFailure(logger.write(record))
-				}
-			}()
-		}
-	}
-	defer func() {
-		if lookups != nil {
-			close(lookups)
-			workers.Wait()
-		}
-	}()
 
 	seen := make(map[string]time.Time)
 	ticker := time.NewTicker(time.Second)
@@ -271,23 +234,19 @@ func run(configPath string) error {
 				delete(seen, key)
 			}
 		}
-		emit := func(remote endpoint, transport string, allowed bool) {
-			key := transport + ":" + remote.IP.String() + ":" + strconv.Itoa(int(remote.Port)) + ":" + strconv.FormatBool(allowed)
+		var emitErr error
+		emit := func(remote endpoint, transport string, allowed bool, domain string) {
+			if emitErr != nil {
+				return
+			}
+			key := transport + ":" + remote.IP.String() + ":" + strconv.Itoa(int(remote.Port)) + ":" + strconv.FormatBool(allowed) + ":" + domain
 			if allowed && !logAllow {
 				return
 			}
 			if allowed && cfg.Settings.LogLevel != "debug" && !shouldLogObservation(seen, key, now, cfg.Settings.MaxIPEntries) {
 				return
 			}
-			if lookups == nil {
-				reportLogFailure(logger.write(destinationRecord(cfg.Settings.Mode, transport, remote, "", allowed)))
-				return
-			}
-			select {
-			case lookups <- observedDestination{remote, transport, allowed}:
-			default:
-				reportLogFailure(logger.write(destinationRecord(cfg.Settings.Mode, transport, remote, "", allowed)))
-			}
+			emitErr = logger.write(destinationRecord(cfg.Settings.Mode, transport, remote, domain, allowed))
 		}
 		if err := monitor.Drain(emit); err != nil {
 			if logErr := logger.write(auditRecord{Level: "ERROR", Event: "observation_drain_failed", Error: err.Error()}); logErr != nil {
@@ -295,23 +254,11 @@ func run(configPath string) error {
 			}
 			return err
 		}
-		select {
-		case err := <-logFailures:
-			return err
-		default:
+		if emitErr != nil {
+			return emitErr
 		}
 		select {
 		case <-ctx.Done():
-			if lookups != nil {
-				close(lookups)
-				workers.Wait()
-				lookups = nil
-			}
-			select {
-			case err := <-logFailures:
-				return err
-			default:
-			}
 			return logger.write(auditRecord{Level: "INFO", Event: "service_stopped"})
 		case <-ticker.C:
 		}
@@ -344,16 +291,6 @@ func notifySystemdReady() error {
 	defer connection.Close()
 	_, err = connection.Write([]byte("READY=1"))
 	return err
-}
-
-func reverseDNS(ctx context.Context, ip netip.Addr) string {
-	lookupCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	defer cancel()
-	names, err := net.DefaultResolver.LookupAddr(lookupCtx, ip.String())
-	if err != nil || len(names) == 0 {
-		return ""
-	}
-	return strings.TrimSuffix(names[0], ".")
 }
 
 func main() {

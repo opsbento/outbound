@@ -17,6 +17,20 @@ struct dns_permission {
     struct port_set ports;
 };
 
+struct dns_suffix_hash {
+    __u64 first;
+    __u64 second;
+};
+
+struct dns_name {
+    __u64 expiry;
+    __u64 observed_at;
+    struct dns_suffix_hash hash;
+    __u32 length;
+    __u32 ambiguous;
+    __u8 wire[128];
+};
+
 struct destination_key {
     __u8 family;
     __u8 protocol;
@@ -46,11 +60,6 @@ struct ipv6_key {
     __u8 address[16];
 };
 
-struct dns_suffix_hash {
-    __u64 first;
-    __u64 second;
-};
-
 struct dns_ipv6_key {
     __u8 address[16];
 };
@@ -70,6 +79,8 @@ struct answer_scan {
     struct __sk_buff *skb;
     __u32 offset;
     struct port_set ports;
+    __u32 matched;
+    struct dns_name name;
 };
 
 struct {
@@ -99,6 +110,20 @@ struct {
     __type(key, struct dns_ipv6_key);
     __type(value, struct dns_permission);
 } dns_ipv6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, struct dns_name);
+} dns_names_ipv4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct dns_ipv6_key);
+    __type(value, struct dns_name);
+} dns_names_ipv6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -165,6 +190,20 @@ static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
         __builtin_memcpy(key.address, &ctx->user_ip4, 4);
     else
         __builtin_memcpy(key.address, ctx->user_ip6, 16);
+
+    // Loopback stays on this host. In particular, the local DNS stub sends
+    // replies to an ephemeral port on 127.0.0.1; blocking those replies
+    // prevents the daemon from resolving its own exact-domain policy.
+    if (family == 4 && key.address[0] == 127)
+        return 1;
+    if (family == 6) {
+        int loopback = key.address[15] == 1;
+#pragma unroll
+        for (int i = 0; i < 15; i++)
+            loopback &= key.address[i] == 0;
+        if (loopback)
+            return 1;
+    }
 
     int allowed = 0;
     if (family == 4) {
@@ -245,12 +284,14 @@ static long hash_suffix_byte(__u64 index, void *data)
         byte += 'a' - 'A';
     scan->hash.first = scan->hash.first * 131 + byte;
     scan->hash.second = scan->hash.second * 137 + byte;
+    // Keep hashing the full query. A later, more specific suffix may replace
+    // the ports selected by an earlier wildcard match.
     if (relative == 0) {
         struct port_set *ports = bpf_map_lookup_elem(&dns_exact, &scan->hash);
         if (ports) {
             scan->ports = *ports;
             scan->matched = 1;
-            return 1;
+            return 0;
         }
     } else if (relative < 128) {
         __u64 label_bit = relative < 64
@@ -261,15 +302,16 @@ static long hash_suffix_byte(__u64 index, void *data)
             if (ports) {
                 scan->ports = *ports;
                 scan->matched = 1;
-                return 1;
+                return 0;
             }
         }
     }
     return 0;
 }
 
-static __always_inline int allowed_question(struct __sk_buff *skb, __u32 start, __u32 *end, struct port_set *ports)
+static __always_inline int parse_question(struct answer_scan *answer, __u32 start, __u32 *end)
 {
+    struct __sk_buff *skb = answer->skb;
     __u32 pos = start;
     struct wildcard_scan scan = {.skb = skb, .start = start};
     __u32 count = 0;
@@ -297,10 +339,17 @@ static __always_inline int allowed_question(struct __sk_buff *skb, __u32 start, 
         return 0;
 
     scan.length = *end - start;
+    if (scan.length == 0 || scan.length > sizeof(answer->name.wire))
+        return 0;
     if (bpf_loop(scan.length, hash_suffix_byte, &scan, 0) < 0)
         return 0;
-    if (scan.matched) *ports = scan.ports;
-    return scan.matched;
+    if (bpf_skb_load_bytes(skb, start, answer->name.wire, scan.length) != 0)
+        return 0;
+    answer->name.length = scan.length;
+    answer->name.hash = scan.hash;
+    answer->matched = scan.matched;
+    if (scan.matched) answer->ports = scan.ports;
+    return 1;
 }
 
 static __always_inline int public_ipv4(const __u8 *ip)
@@ -336,20 +385,36 @@ static long learn_answer(__u64 index, void *data)
     if (ttl > 3600)
         ttl = 3600;
     if (ttl && record[2] == 0 && record[3] == 1) {
+        scan->name.observed_at = bpf_ktime_get_ns();
+        scan->name.expiry = scan->name.observed_at + (__u64)ttl * 1000000000ULL;
         struct dns_permission permission = {
-            .expiry = bpf_ktime_get_ns() + (__u64)ttl * 1000000000ULL,
+            .expiry = scan->name.expiry,
             .ports = scan->ports,
         };
         if (record[0] == 0 && record[1] == 1 && length == 4) {
             __u32 address;
             if (bpf_skb_load_bytes(skb, payload, &address, 4) == 0 &&
-                public_ipv4((const __u8 *)&address))
-                bpf_map_update_elem(&dns_ipv4, &address, &permission, BPF_ANY);
+                public_ipv4((const __u8 *)&address)) {
+                struct dns_name *old = bpf_map_lookup_elem(&dns_names_ipv4, &address);
+                scan->name.ambiguous = old && old->expiry > bpf_ktime_get_ns() &&
+                    (old->ambiguous || old->hash.first != scan->name.hash.first ||
+                     old->hash.second != scan->name.hash.second);
+                bpf_map_update_elem(&dns_names_ipv4, &address, &scan->name, BPF_ANY);
+                if (scan->matched)
+                    bpf_map_update_elem(&dns_ipv4, &address, &permission, BPF_ANY);
+            }
         } else if (record[0] == 0 && record[1] == 28 && length == 16) {
             __u8 address[16];
             if (bpf_skb_load_bytes(skb, payload, address, 16) == 0 &&
-                public_ipv6(address))
-                bpf_map_update_elem(&dns_ipv6, address, &permission, BPF_ANY);
+                public_ipv6(address)) {
+                struct dns_name *old = bpf_map_lookup_elem(&dns_names_ipv6, address);
+                scan->name.ambiguous = old && old->expiry > bpf_ktime_get_ns() &&
+                    (old->ambiguous || old->hash.first != scan->name.hash.first ||
+                     old->hash.second != scan->name.hash.second);
+                bpf_map_update_elem(&dns_names_ipv6, address, &scan->name, BPF_ANY);
+                if (scan->matched)
+                    bpf_map_update_elem(&dns_ipv6, address, &permission, BPF_ANY);
+            }
         }
     }
     scan->offset = payload + length;
@@ -406,13 +471,13 @@ int observe_dns_reply(struct __sk_buff *skb)
         return 1;
     __u32 question = dns + 12;
     __u32 offset = 0;
-    struct port_set ports = {};
-    if (!allowed_question(skb, question, &offset, &ports))
+    struct answer_scan scan = {.skb = skb};
+    if (!parse_question(&scan, question, &offset))
         return 1;
     __u8 query[4];
     if (bpf_skb_load_bytes(skb, offset, query, 4) != 0 || query[2] != 0 || query[3] != 1)
         return 1;
-    struct answer_scan scan = {.skb = skb, .offset = offset + 4, .ports = ports};
+    scan.offset = offset + 4;
     bpf_loop(answers, learn_answer, &scan, 0);
     return 1;
 }

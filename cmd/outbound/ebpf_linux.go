@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
 )
 
 //go:embed connect.bpf.o
@@ -58,6 +59,41 @@ type ipv6Key struct {
 type dnsSuffixHash struct {
 	First  uint64
 	Second uint64
+}
+
+type dnsName struct {
+	Expiry     uint64
+	ObservedAt uint64
+	Hash       dnsSuffixHash
+	Length     uint32
+	Ambiguous  uint32
+	Wire       [128]byte
+}
+
+func (name dnsName) domain() string {
+	if name.Ambiguous != 0 || name.Length < 2 || name.Length > uint32(len(name.Wire)) {
+		return ""
+	}
+	var labels []string
+	for offset := uint32(0); offset < name.Length; {
+		length := uint32(name.Wire[offset])
+		offset++
+		if length == 0 {
+			if offset == name.Length {
+				domain := strings.ToLower(strings.Join(labels, "."))
+				if validDomain(domain) {
+					return domain
+				}
+			}
+			return ""
+		}
+		if length > 63 || offset+length >= name.Length {
+			return ""
+		}
+		labels = append(labels, string(name.Wire[offset:offset+length]))
+		offset += length
+	}
+	return ""
 }
 
 func dnsNameHash(name string) (dnsSuffixHash, error) {
@@ -220,7 +256,7 @@ func openConnectMonitor(policy []ipRule, enforce, coverAllUDP bool, domains []po
 	}
 	wildcardMap := collection.Maps["dns_wildcards"]
 	exactMap := collection.Maps["dns_exact"]
-	if wildcardMap == nil || exactMap == nil {
+	if wildcardMap == nil || exactMap == nil || collection.Maps["dns_names_ipv4"] == nil || collection.Maps["dns_names_ipv6"] == nil {
 		return nil, errors.New("eBPF DNS domain maps are missing")
 	}
 	for _, rule := range domains {
@@ -342,7 +378,32 @@ func (monitor *connectMonitor) Close() {
 	monitor.collection.Close()
 }
 
-func (monitor *connectMonitor) Drain(emit func(endpoint, string, bool)) error {
+func (monitor *connectMonitor) observedDomain(ip netip.Addr, connectedAt uint64) string {
+	var key any
+	mapName := "dns_names_ipv4"
+	if ip.Is4() {
+		address := ip.As4()
+		key = address
+	} else {
+		address := ip.As16()
+		key = address
+		mapName = "dns_names_ipv6"
+	}
+	var name dnsName
+	if err := monitor.collection.Maps[mapName].Lookup(key, &name); err != nil {
+		return ""
+	}
+	var clock unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &clock); err != nil || name.Expiry <= uint64(clock.Sec)*1_000_000_000+uint64(clock.Nsec) {
+		return ""
+	}
+	if name.ObservedAt > connectedAt || connectedAt-name.ObservedAt > 60*1_000_000_000 {
+		return ""
+	}
+	return name.domain()
+}
+
+func (monitor *connectMonitor) Drain(emit func(endpoint, string, bool, string)) error {
 	destinations := monitor.collection.Maps["destinations"]
 	if destinations == nil {
 		return errors.New("eBPF destinations map is missing")
@@ -353,7 +414,7 @@ func (monitor *connectMonitor) Drain(emit func(endpoint, string, bool)) error {
 	for iterator.Next(&key, &event) {
 		remote, decodeErr := key.endpoint()
 		if decodeErr == nil && remote.Port != 0 {
-			emit(remote, key.transport(), event.Allowed != 0)
+			emit(remote, key.transport(), event.Allowed != 0, monitor.observedDomain(remote.IP, event.Timestamp))
 		}
 		if err := destinations.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete observed destination: %w", err)

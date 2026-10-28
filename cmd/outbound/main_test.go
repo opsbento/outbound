@@ -50,20 +50,41 @@ func TestPolicyControlMatchesEBPFLayout(t *testing.T) {
 	if size := unsafe.Sizeof(portSet{}); size != 36 {
 		t.Fatalf("port set map value is %d bytes, want 36", size)
 	}
+	if size := unsafe.Sizeof(dnsName{}); size != 168 {
+		t.Fatalf("DNS name map value is %d bytes, want 168", size)
+	}
 }
 
 func TestDestinationRecord(t *testing.T) {
 	remote := endpoint{IP: netip.MustParseAddr("8.8.8.8"), Port: 443}
 	allowed := destinationRecord("audit", "TCP", remote, "dns.google", true)
-	if allowed.Decision != "ALLOW" || allowed.DestinationIP != "8.8.8.8" || allowed.DestinationPort != 443 || allowed.PTR != "dns.google" {
+	if allowed.Decision != "ALLOW" || allowed.DestinationIP != "8.8.8.8" || allowed.DestinationPort != 443 || allowed.Domain != "dns.google" || allowed.DomainSource != "dns_answer" {
 		t.Fatalf("allowed record = %+v", allowed)
 	}
 	blocked := destinationRecord("enforce", "UDP", remote, "", false)
-	if blocked.Decision != "BLOCK" || blocked.Level != "WARN" || blocked.Transport != "UDP" {
+	if blocked.Decision != "BLOCK" || blocked.Level != "WARN" || blocked.Transport != "UDP" || blocked.Domain != "" || blocked.DomainSource != "" {
 		t.Fatalf("blocked record = %+v", blocked)
 	}
 	if got := destinationRecord("audit", "TCP", remote, "", false).Decision; got != "WOULD_BLOCK" {
 		t.Fatalf("audit decision = %q", got)
+	}
+}
+
+func TestDNSNameFromWire(t *testing.T) {
+	var name dnsName
+	copy(name.Wire[:], []byte{6, 'G', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0})
+	name.Length = 12
+	if got := name.domain(); got != "google.com" {
+		t.Fatalf("DNS name = %q", got)
+	}
+	name.Ambiguous = 1
+	if got := name.domain(); got != "" {
+		t.Fatalf("ambiguous IP must not be attributed to %q", got)
+	}
+	name.Ambiguous = 0
+	name.Wire[0] = 0xc0
+	if got := name.domain(); got != "" {
+		t.Fatalf("compressed or invalid DNS name = %q", got)
 	}
 }
 

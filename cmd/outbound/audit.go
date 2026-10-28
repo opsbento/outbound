@@ -27,7 +27,8 @@ type auditRecord struct {
 	Transport       string `json:"transport,omitempty"`
 	DestinationIP   string `json:"destination_ip,omitempty"`
 	DestinationPort uint16 `json:"destination_port,omitempty"`
-	PTR             string `json:"ptr,omitempty"`
+	Domain          string `json:"domain,omitempty"`
+	DomainSource    string `json:"domain_source,omitempty"`
 	Aggregation     string `json:"aggregation,omitempty"`
 	PolicyEntries   int    `json:"policy_entries,omitempty"`
 	UDPCoverage     string `json:"udp_coverage,omitempty"`
@@ -69,7 +70,7 @@ func (logger *auditLogger) write(record auditRecord) error {
 	return nil
 }
 
-func destinationRecord(mode, transport string, remote endpoint, ptr string, allowed bool) auditRecord {
+func destinationRecord(mode, transport string, remote endpoint, domain string, allowed bool) auditRecord {
 	decision := "ALLOW"
 	level := "INFO"
 	if !allowed {
@@ -79,14 +80,18 @@ func destinationRecord(mode, transport string, remote endpoint, ptr string, allo
 		}
 		level = "WARN"
 	}
-	return auditRecord{
+	record := auditRecord{
 		Level:           level,
 		Event:           "destination_observed",
 		Decision:        decision,
 		Transport:       transport,
 		DestinationIP:   remote.IP.String(),
 		DestinationPort: remote.Port,
-		PTR:             ptr,
+		Domain:          domain,
 		Aggregation:     "latest_per_destination_per_drain",
 	}
+	if domain != "" {
+		record.DomainSource = "dns_answer"
+	}
+	return record
 }

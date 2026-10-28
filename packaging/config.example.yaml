@@ -4,7 +4,6 @@ settings:
   mode: "audit"
   log_level: "info"
   log_file: "/var/log/outbound/outbound.log"
-  log_reverse_dns: true
   dns_refresh_interval: "30s"
   max_ip_entries: 1024
   cover_all_udp: true        # Allow your DNS resolver at UDP 53 before enforcing.

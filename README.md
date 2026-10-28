@@ -55,7 +55,6 @@ settings:
   mode: "audit"                 # change to "enforce" after checking the logs
   log_level: "info"
   log_file: "/var/log/outbound/outbound.log"
-  log_reverse_dns: true
   dns_refresh_interval: "30s"
   max_ip_entries: 1024
   cover_all_udp: true
@@ -76,7 +75,7 @@ allowlist:
 
 Exact domains are resolved at startup and refreshed periodically. Wildcards learn IPs from ordinary UDP DNS replies; `*.amazonaws.com` does not include `amazonaws.com` itself. Add it separately if needed. The final decision uses destination **IP**, so another service or proxy on an allowed IP can also be reached.
 
-Each CIDR or domain may be a string (any port) or an object with `cidr`/`domain` and `ports` (up to 16 ports). For example, `- {domain: "*.example.com", ports: [1138, 2218]}` permits those ports on learned IPs. Exact-domain and CIDR rules for the same IP combine their ports; the most specific CIDR wins when CIDRs overlap. All TCP and UDP destination ports are checked; `cover_all_udp: true` is required. Allow the DNS resolver IP on port 53 before enforcing. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
+Each CIDR or domain may be a string (any port) or an object with `cidr`/`domain` and `ports` (up to 16 ports). For example, `- {domain: "*.example.com", ports: [1138, 2218]}` permits those ports on learned IPs. Exact-domain and CIDR rules for the same IP combine their ports; the most specific CIDR wins when CIDRs overlap. The hooks check TCP and UDP socket destinations on every port; loopback traffic stays within the host and is exempt. `cover_all_udp: true` is required. Allow the DNS resolver IP on port 53 before enforcing. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
 
 After changing the config:
 
@@ -94,10 +93,10 @@ sudo journalctl -u outbound -n 50 --no-pager
 sudo /usr/local/bin/outbound --policy-status
 ```
 
-The log file contains one JSON object per line. `destination_observed` records the decision, transport, destination IP and port, and optional reverse DNS name. `policy_sha256` identifies the loaded config; compare it with `sha256sum /etc/outbound/config.yaml`. `ip_policy_sha256` on `service_started` and `ip_policy_changed` identifies the resolved exact-domain and CIDR map; it excludes IPs learned from wildcard DNS. Logs also contain the host, boot ID, binary version, and event schema version.
+The log file contains one JSON object per line. `destination_observed` records the decision, transport, destination IP and port, and a DNS-observed `domain` when available. `domain_source: dns_answer` means the name came from a recent DNS answer for that IP; it is not proof of the HTTP Host or TLS SNI. Shared IPs with multiple observed names, cached DNS, direct-IP connections, and encrypted DNS may leave `domain` empty. `policy_sha256` identifies the loaded config; compare it with `sha256sum /etc/outbound/config.yaml`. `ip_policy_sha256` on `service_started` and `ip_policy_changed` identifies the resolved exact-domain and CIDR map; it excludes IPs learned from wildcard DNS.
 
 ```sh
-sudo tail -n 20 /var/log/outbound/outbound.log | jq -c 'select(.event == "destination_observed")'
+sudo tail -n 20 /var/log/outbound/outbound.log | jq -r 'select(.event == "destination_observed") | "\(.decision) \(.transport) \(.domain // .destination_ip):\(.destination_port)"'
 sha256sum /etc/outbound/config.yaml
 ```
 
