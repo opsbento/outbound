@@ -179,10 +179,22 @@ static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
     key.family = family;
     key.protocol = protocol;
     key.port = port;
-    if (family == 4)
-        __builtin_memcpy(key.address, &ctx->user_ip4, 4);
-    else
-        __builtin_memcpy(key.address, ctx->user_ip6, 16);
+    if (family == 4) {
+        __u32 address = ctx->user_ip4;
+        __builtin_memcpy(key.address, &address, sizeof(address));
+    } else {
+        // The verifier only permits constant-offset loads from sock_addr.
+        // Copy each IPv6 word through a stack scalar so LLVM does not form
+        // a modified ctx pointer for a 16-byte memcpy.
+        __u32 word0 = ctx->user_ip6[0];
+        __u32 word1 = ctx->user_ip6[1];
+        __u32 word2 = ctx->user_ip6[2];
+        __u32 word3 = ctx->user_ip6[3];
+        __builtin_memcpy(key.address, &word0, sizeof(word0));
+        __builtin_memcpy(key.address + 4, &word1, sizeof(word1));
+        __builtin_memcpy(key.address + 8, &word2, sizeof(word2));
+        __builtin_memcpy(key.address + 12, &word3, sizeof(word3));
+    }
 
     // Loopback stays on this host. In particular, the local DNS stub sends
     // replies to an ephemeral port on 127.0.0.1; blocking those replies
