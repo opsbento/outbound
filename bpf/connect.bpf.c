@@ -338,14 +338,15 @@ static __always_inline int parse_question(struct answer_scan *answer, __u32 star
     if (*end == 0 || count == 0 || *end - start > 128)
         return 0;
 
-    scan.length = *end - start;
-    if (scan.length == 0 || scan.length > sizeof(answer->name.wire))
+    __u32 qname_length = *end - start;
+    if (qname_length < 2 || qname_length > sizeof(answer->name.wire))
         return 0;
+    if (bpf_skb_load_bytes(skb, start, answer->name.wire, qname_length) != 0)
+        return 0;
+    scan.length = qname_length;
     if (bpf_loop(scan.length, hash_suffix_byte, &scan, 0) < 0)
         return 0;
-    if (bpf_skb_load_bytes(skb, start, answer->name.wire, scan.length) != 0)
-        return 0;
-    answer->name.length = scan.length;
+    answer->name.length = qname_length;
     answer->name.hash = scan.hash;
     answer->matched = scan.matched;
     if (scan.matched) answer->ports = scan.ports;
