@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -20,6 +22,7 @@ struct observation {
 struct policy_control {
     __u32 enforce;
     __u32 slot;
+    __u32 cover_all_udp;
 };
 
 struct ipv4_key {
@@ -116,10 +119,12 @@ static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
 {
     __u16 port = bpf_ntohs(ctx->user_port);
     __u8 protocol;
-    // TCP covers HTTP/1.1, HTTP/2, and HTTPS. UDP 443 covers HTTP/3 (QUIC).
-    // Other UDP traffic, including DNS, is outside this TCP egress policy.
+    __u32 zero = 0;
+    struct policy_control *policy = bpf_map_lookup_elem(&control, &zero);
+    // TCP is always covered. UDP 443 is always covered; other UDP ports are
+    // covered when the operator explicitly enables them in the policy.
     if (ctx->type == OUTBOUND_SOCK_DGRAM) {
-        if (port != 443)
+        if (port != 443 && (!policy || !policy->cover_all_udp))
             return 1;
         protocol = 17;
     } else {
@@ -137,8 +142,6 @@ static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
     else
         __builtin_memcpy(key.address, ctx->user_ip6, 16);
 
-    __u32 zero = 0;
-    struct policy_control *policy = bpf_map_lookup_elem(&control, &zero);
     int allowed = 0;
     if (family == 4) {
         struct ipv4_key lookup = {.prefixlen = 32};
@@ -166,7 +169,8 @@ static __always_inline int observe(struct bpf_sock_addr *ctx, __u8 family)
 
     struct observation event = {.timestamp = bpf_ktime_get_ns(), .allowed = allowed};
     bpf_map_update_elem(&destinations, &key, &event, BPF_ANY);
-    return !policy || !policy->enforce || allowed;
+    // A missing control entry must never turn an attached hook into allow-all.
+    return policy && (!policy->enforce || allowed);
 }
 
 static __always_inline int read_byte(struct __sk_buff *skb, __u32 offset, __u8 *byte)

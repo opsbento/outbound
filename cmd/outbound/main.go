@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 package main
 
 import (
@@ -30,12 +32,15 @@ type config struct {
 		LogReverseDNS      bool   `yaml:"log_reverse_dns"`
 		DNSRefreshInterval string `yaml:"dns_refresh_interval"`
 		MaxIPEntries       int    `yaml:"max_ip_entries"`
+		CoverAllUDP        bool   `yaml:"cover_all_udp"`
 	} `yaml:"settings"`
 	Allowlist struct {
 		Domains []string `yaml:"domains"`
 		CIDRs   []string `yaml:"cidrs"`
 	} `yaml:"allowlist"`
 }
+
+var version = "development"
 
 func loadConfig(path string) (config, error) {
 	var cfg config
@@ -49,6 +54,13 @@ func loadConfig(path string) (config, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return cfg, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return cfg, fmt.Errorf("read trailing configuration: %w", err)
+		}
+		return cfg, errors.New("configuration must contain exactly one YAML document")
 	}
 
 	if cfg.Version != "v1" {
@@ -164,13 +176,13 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
-	monitor, err := openConnectMonitor(policy, cfg.Settings.Mode == "enforce", cfg.Allowlist.Domains)
+	monitor, err := openConnectMonitor(policy, cfg.Settings.Mode == "enforce", cfg.Settings.CoverAllUDP, cfg.Allowlist.Domains)
 	if err != nil {
 		return err
 	}
 	defer monitor.Close()
 	if logEvents {
-		logger.Printf("%s HTTP(S) monitoring started (TCP and QUIC/UDP 443; policy entries: %d, reverse DNS: %t)", strings.ToUpper(cfg.Settings.Mode), len(policy), cfg.Settings.LogReverseDNS)
+		logger.Printf("%s monitoring started (TCP and %s; policy entries: %d, reverse DNS: %t)", strings.ToUpper(cfg.Settings.Mode), map[bool]string{true: "all UDP", false: "UDP 443"}[cfg.Settings.CoverAllUDP], len(policy), cfg.Settings.LogReverseDNS)
 	}
 	if err := notifySystemdReady(); err != nil {
 		return fmt.Errorf("notify systemd readiness: %w", err)
@@ -212,7 +224,7 @@ func run(configPath string) error {
 		if !now.Before(nextRefresh) {
 			updated, err := buildPolicy(ctx, cfg, defaultIPLookup)
 			if err == nil {
-				err = monitor.RefreshPolicy(updated, cfg.Settings.Mode == "enforce")
+				err = monitor.RefreshPolicy(updated, cfg.Settings.Mode == "enforce", cfg.Settings.CoverAllUDP)
 			}
 			if err != nil && logWarnings {
 				logger.Printf("WARN policy refresh failed; previous policy retained: %v", err)
@@ -226,14 +238,9 @@ func run(configPath string) error {
 		}
 		emit := func(remote endpoint, transport string, allowed bool) {
 			key := transport + ":" + remote.IP.String() + ":" + strconv.Itoa(int(remote.Port)) + ":" + strconv.FormatBool(allowed)
-			if _, exists := seen[key]; exists {
-				seen[key] = now
+			if !shouldLogObservation(seen, key, now, cfg.Settings.MaxIPEntries) {
 				return
 			}
-			if len(seen) >= cfg.Settings.MaxIPEntries {
-				return
-			}
-			seen[key] = now
 			if !logEvents {
 				return
 			}
@@ -259,6 +266,17 @@ func run(configPath string) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func shouldLogObservation(seen map[string]time.Time, key string, now time.Time, maxEntries int) bool {
+	if _, exists := seen[key]; exists {
+		seen[key] = now
+		return false
+	}
+	if len(seen) < maxEntries {
+		seen[key] = now
+	}
+	return true
 }
 
 func notifySystemdReady() error {
@@ -304,7 +322,29 @@ func main() {
 	configPath := flag.String("config", "/etc/outbound/config.yaml", "path to YAML configuration")
 	checkConfigOnly := flag.Bool("check-config", false, "validate configuration and resolve allowlisted domains, then exit")
 	checkEBPFOnly := flag.Bool("check-ebpf", false, "load and verify eBPF programs without attaching them, then exit")
+	detachPolicyOnly := flag.Bool("detach-policy", false, "remove pinned eBPF policy links after stopping the service")
+	policyStatusOnly := flag.Bool("policy-status", false, "verify all pinned eBPF policy links are attached")
+	showVersion := flag.Bool("version", false, "print the binary version")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("outbound %s\n", version)
+		return
+	}
+	if *policyStatusOnly {
+		if err := policyStatus(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *detachPolicyOnly {
+		if err := detachPolicy(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("pinned eBPF policy detached")
+		return
+	}
 	if *checkEBPFOnly {
 		if err := checkEBPF(); err != nil {
 			fmt.Fprintln(os.Stderr, err)

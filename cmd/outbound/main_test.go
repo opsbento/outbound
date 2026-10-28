@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 package main
 
 import (
@@ -8,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unsafe"
 )
 
 func TestDestinationKeyEndpoint(t *testing.T) {
@@ -32,6 +36,12 @@ func TestDestinationKeyTransport(t *testing.T) {
 	}
 	if got := (destinationKey{Protocol: 17}).transport(); got != "UDP" {
 		t.Fatalf("QUIC protocol = %q", got)
+	}
+}
+
+func TestPolicyControlMatchesEBPFLayout(t *testing.T) {
+	if size := unsafe.Sizeof(policyControl{}); size != 12 {
+		t.Fatalf("policy control map value is %d bytes, want 12", size)
 	}
 }
 
@@ -196,5 +206,42 @@ func TestAuditConfig(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err != nil {
 		t.Fatalf("wildcard without proxy must be accepted: %v", err)
+	}
+}
+
+func TestConfigRejectsTrailingDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "version: v1\nsettings:\n  mode: audit\n  max_ip_entries: 1024\nallowlist:\n  domains: []\n  cidrs: []\n---\nsettings:\n  mode: enforce\n"
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("multiple YAML documents must be rejected")
+	}
+}
+
+func TestCoverAllUDPConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "version: v1\nsettings:\n  mode: audit\n  cover_all_udp: true\n  max_ip_entries: 1024\nallowlist:\n  domains: []\n  cidrs: []\n"
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Settings.CoverAllUDP {
+		t.Fatal("cover_all_udp was not loaded")
+	}
+}
+
+func TestNewDestinationRemainsVisibleWhenDeduplicationIsFull(t *testing.T) {
+	now := time.Now()
+	seen := map[string]time.Time{"existing": now}
+	if !shouldLogObservation(seen, "new", now, 1) {
+		t.Fatal("new destination was hidden when deduplication was full")
+	}
+	if shouldLogObservation(seen, "existing", now, 1) {
+		t.Fatal("existing destination should still be deduplicated")
 	}
 }

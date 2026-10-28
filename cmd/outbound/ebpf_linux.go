@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 package main
 
 import (
@@ -6,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/cilium/ebpf"
@@ -36,8 +40,9 @@ type observation struct {
 }
 
 type policyControl struct {
-	Enforce uint32
-	Slot    uint32
+	Enforce     uint32
+	Slot        uint32
+	CoverAllUDP uint32
 }
 
 type ipv4Key struct {
@@ -102,6 +107,92 @@ type connectMonitor struct {
 	slot       uint32
 }
 
+const policyPinDir = "/sys/fs/bpf/outbound"
+
+var policyPrograms = []struct {
+	name   string
+	attach ebpf.AttachType
+}{
+	{"egress_connect4", ebpf.AttachCGroupInet4Connect},
+	{"egress_connect6", ebpf.AttachCGroupInet6Connect},
+	{"egress_udp_sendmsg4", ebpf.AttachCGroupUDP4Sendmsg},
+	{"egress_udp_sendmsg6", ebpf.AttachCGroupUDP6Sendmsg},
+	{"observe_dns_reply", ebpf.AttachCGroupInetIngress},
+}
+
+func pinnedPolicyExists() (bool, error) {
+	for _, program := range policyPrograms {
+		_, err := os.Stat(filepath.Join(policyPinDir, program.name))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func detachPolicy() error {
+	for _, program := range policyPrograms {
+		err := os.Remove(filepath.Join(policyPinDir, program.name))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove pinned %s: %w", program.name, err)
+		}
+	}
+	return nil
+}
+
+func policyStatus() error {
+	for _, program := range policyPrograms {
+		path := filepath.Join(policyPinDir, program.name)
+		pinned, err := link.LoadPinnedLink(path, nil)
+		if err != nil {
+			return fmt.Errorf("pinned policy %s unavailable: %w", program.name, err)
+		}
+		info, err := pinned.Info()
+		pinned.Close()
+		if err != nil {
+			return fmt.Errorf("inspect pinned policy %s: %w", program.name, err)
+		}
+		if info.Cgroup() == nil {
+			return fmt.Errorf("pinned policy %s is not attached to a cgroup", program.name)
+		}
+		fmt.Printf("%s: attached (link %d)\n", program.name, info.ID)
+	}
+	return nil
+}
+
+func attachPolicyProgram(program *ebpf.Program, name string, attach ebpf.AttachType, persist bool) (link.Link, error) {
+	path := filepath.Join(policyPinDir, name)
+	if persist {
+		pinned, err := link.LoadPinnedLink(path, nil)
+		if err == nil {
+			if err := pinned.Update(program); err != nil {
+				pinned.Close()
+				return nil, fmt.Errorf("update pinned %s: %w", name, err)
+			}
+			return pinned, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("open pinned %s: %w", name, err)
+		}
+	}
+	attached, err := link.AttachCgroup(link.CgroupOptions{
+		Path: "/sys/fs/cgroup", Attach: attach, Program: program,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("attach %s to root cgroup: %w", name, err)
+	}
+	if persist {
+		if err := attached.Pin(path); err != nil {
+			attached.Close()
+			return nil, fmt.Errorf("pin %s: %w", name, err)
+		}
+	}
+	return attached, nil
+}
+
 func loadConnectCollection() (*ebpf.Collection, error) {
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(connectObject))
 	if err != nil {
@@ -123,7 +214,20 @@ func checkEBPF() error {
 	return nil
 }
 
-func openConnectMonitor(policy []netip.Prefix, enforce bool, domains []string) (_ *connectMonitor, err error) {
+func openConnectMonitor(policy []netip.Prefix, enforce, coverAllUDP bool, domains []string) (_ *connectMonitor, err error) {
+	if enforce {
+		if err := os.MkdirAll(policyPinDir, 0700); err != nil {
+			return nil, fmt.Errorf("create policy pin directory: %w", err)
+		}
+	} else {
+		pinned, err := pinnedPolicyExists()
+		if err != nil {
+			return nil, fmt.Errorf("inspect pinned policy: %w", err)
+		}
+		if pinned {
+			return nil, errors.New("pinned enforce policy remains active; stop outbound and run --detach-policy before switching to audit")
+		}
+	}
 	collection, err := loadConnectCollection()
 	if err != nil {
 		return nil, err
@@ -134,7 +238,7 @@ func openConnectMonitor(policy []netip.Prefix, enforce bool, domains []string) (
 			monitor.Close()
 		}
 	}()
-	if err := monitor.applyPolicy(policy, enforce, 0); err != nil {
+	if err := monitor.applyPolicy(policy, enforce, coverAllUDP, 0); err != nil {
 		return nil, err
 	}
 	wildcardMap := collection.Maps["dns_wildcards"]
@@ -163,44 +267,24 @@ func openConnectMonitor(policy []netip.Prefix, enforce bool, domains []string) (
 			return nil, fmt.Errorf("load DNS domain %q: %w", domain, err)
 		}
 	}
-	for _, program := range []struct {
-		name   string
-		attach ebpf.AttachType
-	}{
-		{"egress_connect4", ebpf.AttachCGroupInet4Connect},
-		{"egress_connect6", ebpf.AttachCGroupInet6Connect},
-		{"egress_udp_sendmsg4", ebpf.AttachCGroupUDP4Sendmsg},
-		{"egress_udp_sendmsg6", ebpf.AttachCGroupUDP6Sendmsg},
-	} {
+	for _, program := range policyPrograms {
+		if program.name == "observe_dns_reply" && len(domains) == 0 && !enforce {
+			continue
+		}
 		p := collection.Programs[program.name]
 		if p == nil {
 			return nil, fmt.Errorf("missing eBPF program %s", program.name)
 		}
-		attached, attachErr := link.AttachCgroup(link.CgroupOptions{
-			Path: "/sys/fs/cgroup", Attach: program.attach, Program: p,
-		})
+		attached, attachErr := attachPolicyProgram(p, program.name, program.attach, enforce)
 		if attachErr != nil {
-			return nil, fmt.Errorf("attach %s to root cgroup: %w", program.name, attachErr)
-		}
-		monitor.links = append(monitor.links, attached)
-	}
-	if len(domains) > 0 {
-		p := collection.Programs["observe_dns_reply"]
-		if p == nil {
-			return nil, errors.New("missing eBPF DNS ingress program")
-		}
-		attached, attachErr := link.AttachCgroup(link.CgroupOptions{
-			Path: "/sys/fs/cgroup", Attach: ebpf.AttachCGroupInetIngress, Program: p,
-		})
-		if attachErr != nil {
-			return nil, fmt.Errorf("attach DNS ingress to root cgroup: %w", attachErr)
+			return nil, attachErr
 		}
 		monitor.links = append(monitor.links, attached)
 	}
 	return monitor, nil
 }
 
-func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce bool, slot uint32) error {
+func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce, coverAllUDP bool, slot uint32) error {
 	v4 := monitor.collection.Maps[fmt.Sprintf("ipv4_policy_%d", slot)]
 	v6 := monitor.collection.Maps[fmt.Sprintf("ipv6_policy_%d", slot)]
 	control := monitor.collection.Maps["control"]
@@ -232,7 +316,11 @@ func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce bool
 		mode = 1
 	}
 	key := uint32(0)
-	state := policyControl{Enforce: mode, Slot: slot}
+	var udpMode uint32
+	if coverAllUDP {
+		udpMode = 1
+	}
+	state := policyControl{Enforce: mode, Slot: slot, CoverAllUDP: udpMode}
 	if err := control.Update(&key, &state, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("activate eBPF policy: %w", err)
 	}
@@ -240,8 +328,8 @@ func (monitor *connectMonitor) applyPolicy(prefixes []netip.Prefix, enforce bool
 	return nil
 }
 
-func (monitor *connectMonitor) RefreshPolicy(prefixes []netip.Prefix, enforce bool) error {
-	return monitor.applyPolicy(prefixes, enforce, 1-monitor.slot)
+func (monitor *connectMonitor) RefreshPolicy(prefixes []netip.Prefix, enforce, coverAllUDP bool) error {
+	return monitor.applyPolicy(prefixes, enforce, coverAllUDP, 1-monitor.slot)
 }
 
 func clearPolicyMap(m *ebpf.Map, keyType any) error {

@@ -6,3 +6,4 @@ dist/
 ansible/
 file.prd
 *.md
+!/README.md

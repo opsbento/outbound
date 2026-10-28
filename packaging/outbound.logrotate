@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+/var/log/outbound/outbound.log {
+    daily
+    maxsize 10M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su outbound outbound
+}

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=outbound Linux egress policy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=20s
+ExecStartPre=/usr/bin/mountpoint --quiet /sys/fs/bpf
+ExecStart=/usr/local/bin/outbound --config /etc/outbound/config.yaml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=outbound
+Restart=on-failure
+RestartSec=5s
+User=outbound
+Group=outbound
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/outbound/config.yaml
+ReadWritePaths=/var/log/outbound
+ReadWritePaths=/sys/fs/bpf/outbound
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

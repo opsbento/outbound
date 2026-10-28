@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+version: "v1"
+settings:
+  mode: "audit"
+  log_level: "info"
+  log_file: "/var/log/outbound/outbound.log"
+  log_reverse_dns: true
+  dns_refresh_interval: "30s"
+  max_ip_entries: 1024
+  cover_all_udp: false       # Set true only after allowing DNS resolver IPs.
+allowlist:
+  domains:
+    - "metadata.google.internal" # Exact: GCE may resolve this from /etc/hosts.
+    - "*.ubuntu.com"          # Ubuntu archives and ESM.
+    - "*.canonical.com"       # Ubuntu Pro and Livepatch.
+    - "*.snapcraft.io"        # Snap API.
+    - "*.snapcraftcontent.com" # Snap content.
+    - "*.google.com"          # Google package and download hosts.
+    - "*.googleapis.com"      # Google Cloud APIs.
+    - "*.amazonaws.com"       # AWS STS, S3, and regional/bucket hosts.
+  cidrs:
+    - "192.0.2.0/24"        # Documentation-only IPv4 range.
+    - "2001:db8::/32"       # Documentation-only IPv6 range.
