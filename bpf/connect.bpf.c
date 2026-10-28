@@ -64,22 +64,15 @@ struct dns_ipv6_key {
     __u8 address[16];
 };
 
-struct wildcard_scan {
-    struct __sk_buff *skb;
-    __u32 start;
-    __u32 length;
-    __u64 label_bits_low;
-    __u64 label_bits_high;
-    struct dns_suffix_hash hash;
-    __u8 matched;
-    struct port_set ports;
-};
-
 struct answer_scan {
     struct __sk_buff *skb;
     __u32 offset;
+    __u32 start;
+    __u64 label_bits_low;
+    __u64 label_bits_high;
     struct port_set ports;
     __u32 matched;
+    __u32 invalid;
     struct dns_name name;
 };
 
@@ -273,21 +266,28 @@ static __always_inline int skip_dns_name(struct __sk_buff *skb, __u32 *offset)
 
 static long hash_suffix_byte(__u64 index, void *data)
 {
-    struct wildcard_scan *scan = data;
-    if (index >= scan->length)
+    struct answer_scan *scan = data;
+    if (index >= scan->name.length)
         return 1;
-    __u32 relative = scan->length - index - 1;
+    __u32 relative = scan->name.length - index - 1;
+    if (relative >= sizeof(scan->name.wire)) {
+        scan->invalid = 1;
+        return 1;
+    }
     __u8 byte;
-    if (!read_byte(scan->skb, scan->start + relative, &byte))
+    if (!read_byte(scan->skb, scan->start + relative, &byte)) {
+        scan->invalid = 1;
         return 1;
+    }
+    scan->name.wire[relative] = byte;
     if (byte >= 'A' && byte <= 'Z')
         byte += 'a' - 'A';
-    scan->hash.first = scan->hash.first * 131 + byte;
-    scan->hash.second = scan->hash.second * 137 + byte;
+    scan->name.hash.first = scan->name.hash.first * 131 + byte;
+    scan->name.hash.second = scan->name.hash.second * 137 + byte;
     // Keep hashing the full query. A later, more specific suffix may replace
     // the ports selected by an earlier wildcard match.
     if (relative == 0) {
-        struct port_set *ports = bpf_map_lookup_elem(&dns_exact, &scan->hash);
+        struct port_set *ports = bpf_map_lookup_elem(&dns_exact, &scan->name.hash);
         if (ports) {
             scan->ports = *ports;
             scan->matched = 1;
@@ -298,7 +298,7 @@ static long hash_suffix_byte(__u64 index, void *data)
             ? (scan->label_bits_low >> relative) & 1
             : (scan->label_bits_high >> (relative - 64)) & 1;
         if (label_bit) {
-            struct port_set *ports = bpf_map_lookup_elem(&dns_wildcards, &scan->hash);
+            struct port_set *ports = bpf_map_lookup_elem(&dns_wildcards, &scan->name.hash);
             if (ports) {
                 scan->ports = *ports;
                 scan->matched = 1;
@@ -313,7 +313,7 @@ static __always_inline int parse_question(struct answer_scan *answer, __u32 star
 {
     struct __sk_buff *skb = answer->skb;
     __u32 pos = start;
-    struct wildcard_scan scan = {.skb = skb, .start = start};
+    answer->start = start;
     __u32 count = 0;
     for (int i = 0; i < 17; i++) {
         __u8 length;
@@ -329,9 +329,9 @@ static __always_inline int parse_question(struct answer_scan *answer, __u32 star
             return 0;
         __u32 relative = pos - start;
         if (relative < 64)
-            scan.label_bits_low |= 1ULL << relative;
+            answer->label_bits_low |= 1ULL << relative;
         else
-            scan.label_bits_high |= 1ULL << (relative - 64);
+            answer->label_bits_high |= 1ULL << (relative - 64);
         count = i + 1;
         pos += length + 1;
     }
@@ -339,21 +339,11 @@ static __always_inline int parse_question(struct answer_scan *answer, __u32 star
         return 0;
 
     __u32 qname_length = *end - start;
-    if (qname_length > sizeof(answer->name.wire))
-        return 0;
-    // The verifier needs a bounded, non-negative scalar at the helper call.
-    qname_length &= 0xff;
-    if (qname_length < 2)
-        return 0;
-    if (bpf_skb_load_bytes(skb, start, answer->name.wire, qname_length) != 0)
-        return 0;
-    scan.length = qname_length;
-    if (bpf_loop(scan.length, hash_suffix_byte, &scan, 0) < 0)
+    if (qname_length < 2 || qname_length > sizeof(answer->name.wire))
         return 0;
     answer->name.length = qname_length;
-    answer->name.hash = scan.hash;
-    answer->matched = scan.matched;
-    if (scan.matched) answer->ports = scan.ports;
+    if (bpf_loop(qname_length, hash_suffix_byte, answer, 0) < 0 || answer->invalid)
+        return 0;
     return 1;
 }
 
