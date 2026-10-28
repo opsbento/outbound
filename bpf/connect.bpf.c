@@ -335,11 +335,15 @@ static __always_inline int parse_question(struct answer_scan *answer, __u32 star
         count = i + 1;
         pos += length + 1;
     }
-    if (*end == 0 || count == 0 || *end - start > 128)
+    if (count == 0 || *end <= start)
         return 0;
 
     __u32 qname_length = *end - start;
-    if (qname_length < 2 || qname_length > sizeof(answer->name.wire))
+    if (qname_length > sizeof(answer->name.wire))
+        return 0;
+    // The verifier needs a bounded, non-negative scalar at the helper call.
+    qname_length &= 0xff;
+    if (qname_length < 2)
         return 0;
     if (bpf_skb_load_bytes(skb, start, answer->name.wire, qname_length) != 0)
         return 0;
