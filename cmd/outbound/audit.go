@@ -12,27 +12,27 @@ import (
 
 // A destination record represents an observation, not an individual connection.
 type auditRecord struct {
-	Time            string `json:"time"`
-	SchemaVersion   int    `json:"schema_version"`
-	Level           string `json:"level"`
-	Event           string `json:"event"`
-	Service         string `json:"service"`
-	Host            string `json:"host,omitempty"`
-	BootID          string `json:"boot_id,omitempty"`
-	Version         string `json:"version"`
-	Mode            string `json:"mode,omitempty"`
-	PolicySHA256    string `json:"policy_sha256,omitempty"`
-	IPPolicySHA256  string `json:"ip_policy_sha256,omitempty"`
-	Decision        string `json:"decision,omitempty"`
-	Transport       string `json:"transport,omitempty"`
-	DestinationIP   string `json:"destination_ip,omitempty"`
-	DestinationPort uint16 `json:"destination_port,omitempty"`
-	Domain          string `json:"domain,omitempty"`
-	DomainSource    string `json:"domain_source,omitempty"`
-	Aggregation     string `json:"aggregation,omitempty"`
-	PolicyEntries   int    `json:"policy_entries,omitempty"`
-	UDPCoverage     string `json:"udp_coverage,omitempty"`
-	Error           string `json:"error,omitempty"`
+	Time            string   `json:"time"`
+	SchemaVersion   int      `json:"schema_version"`
+	Level           string   `json:"level"`
+	Event           string   `json:"event"`
+	Service         string   `json:"service,omitempty"`
+	Host            string   `json:"host,omitempty"`
+	BootID          string   `json:"boot_id,omitempty"`
+	Version         string   `json:"version,omitempty"`
+	Mode            string   `json:"mode,omitempty"`
+	PolicySHA256    string   `json:"policy_sha256,omitempty"`
+	IPPolicySHA256  string   `json:"ip_policy_sha256,omitempty"`
+	Decision        string   `json:"decision,omitempty"`
+	Transport       string   `json:"transport,omitempty"`
+	Transports      []string `json:"transports,omitempty"`
+	DestinationIP   string   `json:"destination_ip,omitempty"`
+	DestinationPort uint16   `json:"destination_port,omitempty"`
+	Domain          string   `json:"domain,omitempty"`
+	IPCount         int      `json:"ip_count,omitempty"`
+	PolicyEntries   int      `json:"policy_entries,omitempty"`
+	UDPCoverage     string   `json:"udp_coverage,omitempty"`
+	Error           string   `json:"error,omitempty"`
 }
 
 type auditLogger struct {
@@ -47,12 +47,14 @@ type auditLogger struct {
 func (logger *auditLogger) write(record auditRecord) error {
 	record.Time = time.Now().UTC().Format(time.RFC3339Nano)
 	record.SchemaVersion = 1
-	record.Service = "outbound"
-	record.Host = logger.host
-	record.BootID = logger.bootID
-	record.Version = version
+	if record.Event != "outgoing_traffic" {
+		record.Service = "outbound"
+		record.Host = logger.host
+		record.BootID = logger.bootID
+		record.Version = version
+		record.PolicySHA256 = logger.hash
+	}
 	record.Mode = logger.mode
-	record.PolicySHA256 = logger.hash
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("encode audit event: %w", err)
@@ -82,16 +84,12 @@ func destinationRecord(mode, transport string, remote endpoint, domain string, a
 	}
 	record := auditRecord{
 		Level:           level,
-		Event:           "destination_observed",
+		Event:           "outgoing_traffic",
 		Decision:        decision,
 		Transport:       transport,
 		DestinationIP:   remote.IP.String(),
 		DestinationPort: remote.Port,
 		Domain:          domain,
-		Aggregation:     "latest_per_destination_per_drain",
-	}
-	if domain != "" {
-		record.DomainSource = "dns_answer"
 	}
 	return record
 }

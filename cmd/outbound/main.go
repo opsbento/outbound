@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -234,19 +235,35 @@ func run(configPath string) error {
 				delete(seen, key)
 			}
 		}
-		var emitErr error
+		grouped := make(map[string]*auditRecord)
+		groupIPs := make(map[string]map[string]struct{})
+		groupTransports := make(map[string]map[string]struct{})
 		emit := func(remote endpoint, transport string, allowed bool, domain string) {
-			if emitErr != nil {
-				return
-			}
-			key := transport + ":" + remote.IP.String() + ":" + strconv.Itoa(int(remote.Port)) + ":" + strconv.FormatBool(allowed) + ":" + domain
 			if allowed && !logAllow {
 				return
 			}
-			if allowed && cfg.Settings.LogLevel != "debug" && !shouldLogObservation(seen, key, now, cfg.Settings.MaxIPEntries) {
-				return
+			key := strconv.Itoa(int(remote.Port)) + ":" + strconv.FormatBool(allowed) + ":"
+			if domain != "" {
+				key += "domain:" + domain
+			} else {
+				key += transport + ":ip:" + remote.IP.String()
 			}
-			emitErr = logger.write(destinationRecord(cfg.Settings.Mode, transport, remote, domain, allowed))
+			record := grouped[key]
+			if record == nil {
+				newRecord := destinationRecord(cfg.Settings.Mode, transport, remote, domain, allowed)
+				if domain != "" {
+					newRecord.DestinationIP = ""
+					newRecord.Transport = ""
+					groupIPs[key] = make(map[string]struct{})
+					groupTransports[key] = make(map[string]struct{})
+				}
+				grouped[key] = &newRecord
+				record = &newRecord
+			}
+			if domain != "" {
+				groupIPs[key][remote.IP.String()] = struct{}{}
+				groupTransports[key][transport] = struct{}{}
+			}
 		}
 		if err := monitor.Drain(emit); err != nil {
 			if logErr := logger.write(auditRecord{Level: "ERROR", Event: "observation_drain_failed", Error: err.Error()}); logErr != nil {
@@ -254,8 +271,26 @@ func run(configPath string) error {
 			}
 			return err
 		}
-		if emitErr != nil {
-			return emitErr
+		keys := make([]string, 0, len(grouped))
+		for key := range grouped {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			record := grouped[key]
+			if record.Decision == "ALLOW" && cfg.Settings.LogLevel != "debug" && !shouldLogObservation(seen, key, now, cfg.Settings.MaxIPEntries) {
+				continue
+			}
+			if record.Domain != "" {
+				record.IPCount = len(groupIPs[key])
+				for transport := range groupTransports[key] {
+					record.Transports = append(record.Transports, transport)
+				}
+				sort.Strings(record.Transports)
+			}
+			if err := logger.write(*record); err != nil {
+				return err
+			}
 		}
 		select {
 		case <-ctx.Done():

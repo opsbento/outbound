@@ -65,7 +65,7 @@ allowlist:
     - "*.googleapis.com"
     - "*.amazonaws.com"
   cidrs:
-    - cidr: "127.0.0.53/32" # Ubuntu DNS stub; confirm /etc/resolv.conf
+    - cidr: "169.254.169.254/32" # GCE DNS resolver; local 127.0.0.53 is exempt
       ports: [53]
     - cidr: "10.10.10.10/32" # SSH allowed only to this IP
       ports: [22, 2222]
@@ -75,7 +75,7 @@ allowlist:
 
 Exact domains are resolved at startup and refreshed periodically. Wildcards learn IPs from ordinary UDP DNS replies; `*.amazonaws.com` does not include `amazonaws.com` itself. Add it separately if needed. The final decision uses destination **IP**, so another service or proxy on an allowed IP can also be reached.
 
-Each CIDR or domain may be a string (any port) or an object with `cidr`/`domain` and `ports` (up to 16 ports). For example, `- {domain: "*.example.com", ports: [1138, 2218]}` permits those ports on learned IPs. Exact-domain and CIDR rules for the same IP combine their ports; the most specific CIDR wins when CIDRs overlap. The hooks check TCP and UDP socket destinations on every port; loopback traffic stays within the host and is exempt. `cover_all_udp: true` is required. Allow the DNS resolver IP on port 53 before enforcing. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
+Each CIDR or domain may be a string (any port) or an object with `cidr`/`domain` and `ports` (up to 16 ports). For example, `- {domain: "*.example.com", ports: [1138, 2218]}` permits those ports on learned IPs. Exact-domain and CIDR rules for the same IP combine their ports; the most specific CIDR wins when CIDRs overlap. The hooks check TCP and UDP socket destinations on every port; loopback traffic stays within the host and is exempt. `cover_all_udp: true` is required. The local `127.0.0.53` DNS stub needs no CIDR rule. On GCE, allow the upstream metadata resolver at `169.254.169.254:53`; if your VM uses another upstream resolver, find it with `resolvectl dns` and allow that IP on port 53 instead. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
 
 After changing the config:
 
@@ -93,14 +93,14 @@ sudo journalctl -u outbound -n 50 --no-pager
 sudo /usr/local/bin/outbound --policy-status
 ```
 
-The log file contains one JSON object per line. `destination_observed` records the decision, transport, destination IP and port, and a DNS-observed `domain` when available. `domain_source: dns_answer` means the name came from a recent DNS answer for that IP; it is not proof of the HTTP Host or TLS SNI. Shared IPs with multiple observed names, cached DNS, direct-IP connections, and encrypted DNS may leave `domain` empty. `policy_sha256` identifies the loaded config; compare it with `sha256sum /etc/outbound/config.yaml`. `ip_policy_sha256` on `service_started` and `ip_policy_changed` identifies the resolved exact-domain and CIDR map; it excludes IPs learned from wildcard DNS.
+The log file contains one JSON object per line. `outgoing_traffic` records the decision, port, and a DNS-observed `domain` when available. Connections to multiple IPs or transports for the same domain, port, and decision are grouped into one line with `ip_count` and `transports`. Direct-IP connections use `destination_ip` and `transport`. A DNS-observed name is not proof of the HTTP Host or TLS SNI. Shared IPs with multiple observed names, cached DNS, direct-IP connections, and encrypted DNS may leave `domain` empty. `policy_sha256` on service and policy events identifies the loaded config; compare it with `sha256sum /etc/outbound/config.yaml`. `ip_policy_sha256` on `service_started` and `ip_policy_changed` identifies the resolved exact-domain and CIDR map; it excludes IPs learned from wildcard DNS.
 
 ```sh
-sudo tail -n 20 /var/log/outbound/outbound.log | jq -r 'select(.event == "destination_observed") | "\(.decision) \(.transport) \(.domain // .destination_ip):\(.destination_port)"'
+sudo tail -n 20 /var/log/outbound/outbound.log | jq -r 'select(.event == "outgoing_traffic") | "\(.decision) \(.domain // .destination_ip):\(.destination_port) \(.transports // [.transport])"'
 sha256sum /etc/outbound/config.yaml
 ```
 
-Destination logs are aggregated by eBPF per destination between one-second drains. At `log_level: info`, repeated ALLOW destinations are logged at most once every five minutes; BLOCK and WOULD_BLOCK decisions are never suppressed by that setting. Use `log_level: debug` for more detail. This is not a per-connection or per-process audit trail. The local logrotate file keeps seven rotated files; forward the JSONL or journal to a protected central log service for longer retention and review.
+Destination logs are aggregated by eBPF per destination between one-second drains, then grouped by domain when known. At `log_level: info`, repeated ALLOW groups are logged at most once every five minutes; BLOCK and WOULD_BLOCK decisions are never suppressed by that setting. Use `log_level: debug` for more detail. This is not a per-connection or per-process audit trail. The local logrotate file keeps seven rotated files; forward the JSONL or journal to a protected central log service for longer retention and review.
 
 Pinned eBPF links retain the selected mode if the daemon stops or crashes. Changing `mode` and restarting the service updates those links, including `enforce` to `audit`. A reboot clears the links until the service starts again. To intentionally disable enforcement, use a trusted console or SSH session:
 

@@ -58,11 +58,11 @@ func TestPolicyControlMatchesEBPFLayout(t *testing.T) {
 func TestDestinationRecord(t *testing.T) {
 	remote := endpoint{IP: netip.MustParseAddr("8.8.8.8"), Port: 443}
 	allowed := destinationRecord("audit", "TCP", remote, "dns.google", true)
-	if allowed.Decision != "ALLOW" || allowed.DestinationIP != "8.8.8.8" || allowed.DestinationPort != 443 || allowed.Domain != "dns.google" || allowed.DomainSource != "dns_answer" {
+	if allowed.Event != "outgoing_traffic" || allowed.Decision != "ALLOW" || allowed.DestinationIP != "8.8.8.8" || allowed.DestinationPort != 443 || allowed.Domain != "dns.google" {
 		t.Fatalf("allowed record = %+v", allowed)
 	}
 	blocked := destinationRecord("enforce", "UDP", remote, "", false)
-	if blocked.Decision != "BLOCK" || blocked.Level != "WARN" || blocked.Transport != "UDP" || blocked.Domain != "" || blocked.DomainSource != "" {
+	if blocked.Decision != "BLOCK" || blocked.Level != "WARN" || blocked.Transport != "UDP" || blocked.Domain != "" {
 		t.Fatalf("blocked record = %+v", blocked)
 	}
 	if got := destinationRecord("audit", "TCP", remote, "", false).Decision; got != "WOULD_BLOCK" {
