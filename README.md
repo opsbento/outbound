@@ -1,15 +1,37 @@
 # outbound
 
-`outbound` monitors outgoing connections on Linux. In `audit` mode it logs destinations without blocking them. In `enforce` mode it blocks destinations outside the configured domain and CIDR allowlist.
+`outbound` monitors and controls outgoing TCP and UDP connections on Linux. Use `audit` mode to see where applications connect, then switch to `enforce` to block destinations outside the domain and CIDR allowlist. It supports Linux `amd64` and `arm64` with systemd, cgroup v2, and the required eBPF hooks (kernel 5.17 or newer).
 
-It supports Linux `amd64` and `arm64` with systemd, cgroup v2, and a kernel that supports the required eBPF hooks (5.17 or newer). Start in `audit` mode on your target VM.
+## How it works
+
+```mermaid
+flowchart LR
+    A[Application] --> B[DNS lookup]
+    B --> C[DNS reply]
+    C --> D[eBPF learns domain-to-IP mapping]
+    A --> E[TCP connect or UDP send]
+    E --> F[eBPF checks destination IP and port]
+    D --> F
+    G[Domain and CIDR rules] --> F
+    F -->|allowed| H[Connection proceeds]
+    F -->|unlisted in enforce mode| I[Connection blocked]
+    F --> J[Audit log]
+```
+
+Exact domains resolve at startup and refresh on the configured interval. Wildcard rules learn IPs from ordinary UDP DNS replies before the application uses them. The final decision uses the destination IP and port; audit events include the observed domain when it can be identified.
+
+## Why it works
+
+The eBPF hooks run at the socket boundary, before an outbound connection is authorized, so a blocked TCP connect or UDP send cannot proceed. Pinned eBPF links keep the selected policy attached if the daemon stops. A reboot removes those links until the service starts again.
+
+This is an **IP-based** policy. A shared IP allowed for one domain can also be used to reach another service or proxy on that IP. DNS over HTTPS/TLS/TCP, cached answers, and direct-IP connections do not teach wildcard rules a domain. An observed domain is not proof of the HTTP Host or TLS SNI.
 
 ## Install on Ubuntu
 
-Run these commands **on the VM**. Replace `VERSION` with a published [release](https://github.com/opsbento/outbound/releases) tag.
+Run on the VM. Replace `VERSION` with a published [release tag](https://github.com/opsbento/outbound/releases) containing the files in [`example/`](example/).
 
 ```sh
-VERSION=vX.Y.Z  # replace with a published release tag
+VERSION=vX.Y.Z
 REPO=opsbento/outbound
 case "$(uname -m)" in
   x86_64) ARCH=amd64 ;;
@@ -21,13 +43,13 @@ BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 curl -fL --retry 3 -O "${BASE}/${ASSET}"
 DIGEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" | python3 -c 'import json,re,sys; name=sys.argv[1]; assets=[a for a in json.load(sys.stdin)["assets"] if a["name"]==name]; assert len(assets)==1 and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", assets[0]["digest"]); print(assets[0]["digest"].split(":",1)[1])' "$ASSET") || exit 1
 printf '%s  %s\n' "$DIGEST" "$ASSET" | sha256sum --check || exit 1
-RAW="https://raw.githubusercontent.com/${REPO}/${VERSION}/packaging"
+RAW="https://raw.githubusercontent.com/${REPO}/${VERSION}/example"
 for file in config.example.yaml outbound.service outbound.logrotate; do
   curl -fL --retry 3 -O "${RAW}/${file}" || exit 1
 done
 ```
 
-Review `config.example.yaml`, then install the downloaded files:
+Review `config.example.yaml` and replace the documentation-only CIDRs before enabling enforcement. Install the files:
 
 ```sh
 sudo groupadd --system --force outbound
@@ -43,66 +65,38 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now outbound
 ```
 
-The included config starts in `audit` mode. The systemd unit prepares `/sys/fs/bpf/outbound` and runs the daemon as the `outbound` user.
+## Configure and verify
 
-## Configure
-
-Edit `/etc/outbound/config.yaml`. This is a short example; see the [sample config](packaging/config.example.yaml) for more domains.
+Edit `/etc/outbound/config.yaml`. The [example config](example/config.example.yaml) starts in `audit` mode. Domain or CIDR entries can be strings (any port) or objects with `ports` (up to 16 ports):
 
 ```yaml
-version: "v1"
-settings:
-  mode: "audit"                 # change to "enforce" after checking the logs
-  log_level: "info"
-  log_file: "/var/log/outbound/outbound.log"
-  dns_refresh_interval: "30s"
-  max_ip_entries: 1024
-  cover_all_udp: true
 allowlist:
   domains:
-    - "metadata.google.internal"
-    - "*.ubuntu.com"
-    - "*.googleapis.com"
     - "*.amazonaws.com"
+    - domain: "*.example.com"
+      ports: [1138, 2218]
   cidrs:
-    - cidr: "169.254.169.254/32" # GCE DNS resolver; local 127.0.0.53 is exempt
+    - cidr: "169.254.169.254/32" # GCE DNS resolver
       ports: [53]
-    - cidr: "10.10.10.10/32" # SSH allowed only to this IP
+    - cidr: "10.10.10.10/32" # SSH destination
       ports: [22, 2222]
-    - cidr: "10.10.10.20/32" # app port allowed only to this IP
-      ports: [3000]
 ```
 
-Exact domains are resolved at startup and refreshed periodically. Wildcards learn IPs from ordinary UDP DNS replies; `*.amazonaws.com` does not include `amazonaws.com` itself. Add it separately if needed. The final decision uses destination **IP**, so another service or proxy on an allowed IP can also be reached.
+`*.amazonaws.com` does not include `amazonaws.com` itself. The hooks cover TCP and UDP ports; `cover_all_udp: true` is required. Loopback, including `127.0.0.53`, is exempt. On GCE, allow the upstream resolver at `169.254.169.254:53`; on other hosts, check `resolvectl dns` and allow the actual upstream resolver on port 53.
 
-Each CIDR or domain may be a string (any port) or an object with `cidr`/`domain` and `ports` (up to 16 ports). For example, `- {domain: "*.example.com", ports: [1138, 2218]}` permits those ports on learned IPs. Exact-domain and CIDR rules for the same IP combine their ports; the most specific CIDR wins when CIDRs overlap. The hooks check TCP and UDP socket destinations on every port; loopback traffic stays within the host and is exempt. `cover_all_udp: true` is required. The local `127.0.0.53` DNS stub needs no CIDR rule. On GCE, allow the upstream metadata resolver at `169.254.169.254:53`; if your VM uses another upstream resolver, find it with `resolvectl dns` and allow that IP on port 53 instead. DNS over HTTPS/TLS/TCP and cached DNS answers cannot teach wildcard IPs to the DNS hook.
-
-After changing the config:
+After reviewing the audit log, set `settings.mode` to `enforce`, then validate and restart:
 
 ```sh
 sudo /usr/local/bin/outbound --check-config --config /etc/outbound/config.yaml
 sudo systemctl restart outbound
-```
-
-## Check status and logs
-
-```sh
-sudo systemctl status outbound --no-pager -l
-sudo tail -f /var/log/outbound/outbound.log
-sudo journalctl -u outbound -n 50 --no-pager
+sudo systemctl is-active outbound
 sudo /usr/local/bin/outbound --policy-status
+sudo tail -f /var/log/outbound/outbound.log
 ```
 
-The log file contains one JSON object per line. `outgoing_traffic` records the decision, port, and a DNS-observed `domain` when available. Connections to multiple IPs or transports for the same domain, port, and decision are grouped into one line with `ip_count` and `transports`. Direct-IP connections use `destination_ip` and `transport`. A DNS-observed name is not proof of the HTTP Host or TLS SNI. Shared IPs with multiple observed names, cached DNS, direct-IP connections, and encrypted DNS may leave `domain` empty. `policy_sha256` on service and policy events identifies the loaded config; compare it with `sha256sum /etc/outbound/config.yaml`. `ip_policy_sha256` on `service_started` and `ip_policy_changed` identifies the resolved exact-domain and CIDR map; it excludes IPs learned from wildcard DNS.
+The log is JSON Lines. `outgoing_traffic` shows `ALLOW`, `WOULD_BLOCK` (audit mode), or `BLOCK` (enforce mode). When a domain is known, attempts with the same domain, port, and decision within one drain are grouped into one record with `transports` and `ip_count`. Direct-IP traffic includes `destination_ip`. This is a destination summary, not a per-process or per-connection trail. Service and policy events carry policy hashes for audit correlation.
 
-```sh
-sudo tail -n 20 /var/log/outbound/outbound.log | jq -r 'select(.event == "outgoing_traffic") | "\(.decision) \(.domain // .destination_ip):\(.destination_port) \(.transports // [.transport])"'
-sha256sum /etc/outbound/config.yaml
-```
-
-Destination logs are aggregated by eBPF per destination between one-second drains, then grouped by domain when known. At `log_level: info`, repeated ALLOW groups are logged at most once every five minutes; BLOCK and WOULD_BLOCK decisions are never suppressed by that setting. Use `log_level: debug` for more detail. This is not a per-connection or per-process audit trail. The local logrotate file keeps seven rotated files; forward the JSONL or journal to a protected central log service for longer retention and review.
-
-Pinned eBPF links retain the selected mode if the daemon stops or crashes. Changing `mode` and restarting the service updates those links, including `enforce` to `audit`. A reboot clears the links until the service starts again. To intentionally disable enforcement, use a trusted console or SSH session:
+To intentionally remove enforcement, stop the service and detach the pinned policy from a trusted session:
 
 ```sh
 sudo systemctl stop outbound

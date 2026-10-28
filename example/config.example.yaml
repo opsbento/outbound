@@ -20,6 +20,8 @@ allowlist:
     - domain: "*.example.com"  # Documentation-only custom service.
       ports: [1138, 2218]
   cidrs:
+    - cidr: "169.254.169.254/32" # GCE upstream DNS resolver.
+      ports: [53]
     - cidr: "192.0.2.10/32" # Documentation-only SSH destination.
       ports: [443, 8080, 22]
     - cidr: "192.0.2.20/32" # Documentation-only application destination.
